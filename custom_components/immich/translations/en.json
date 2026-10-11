@@ -1,7 +1,8 @@
 {
     "config": {
         "abort": {
-            "already_configured": "Device is already configured"
+            "already_configured": "Device is already configured",
+            "reauth_successful": "Re-authentication was successful"
         },
         "error": {
             "cannot_connect": "Failed to connect",
@@ -14,6 +15,13 @@
                     "api_key": "API key",
                     "host": "Host"
                 }
+            },
+            "reauth_confirm": {
+                "title": "Immich needs a new API key",
+                "description": "Immich did not accept the stored API key. Enter a new one.",
+                "data": {
+                    "api_key": "API key"
+                }
             }
         }
     },
@@ -24,6 +32,10 @@
                     "watched_albums": "Albums for which entities will be created"
                 }
             }
+        },
+        "abort": {
+            "invalid_auth": "Invalid authentication",
+            "cannot_connect": "Failed to connect"
         }
     }
 }

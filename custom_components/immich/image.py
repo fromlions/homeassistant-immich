@@ -1,17 +1,17 @@
 """Image device for Immich integration."""
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta
 import logging
 import random
 
 from homeassistant.components.image import ImageEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_API_KEY, CONF_HOST
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
+from . import ImmichConfigEntry
 from .const import CONF_WATCHED_ALBUMS
 from .hub import ImmichHub
 
@@ -19,20 +19,21 @@ SCAN_INTERVAL = timedelta(minutes=5)
 
 # How often to refresh the list of available asset IDs
 _ID_LIST_REFRESH_INTERVAL = timedelta(hours=12)
+# Pictures tried for one refresh before it gives up and the entity keeps showing the previous one.
+_MAX_ATTEMPTS = 3
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: ImmichConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Immich image platform."""
 
-    hub = ImmichHub(
-        host=config_entry.data[CONF_HOST], api_key=config_entry.data[CONF_API_KEY]
-    )
+    hub = config_entry.runtime_data.hub
+    albums = config_entry.runtime_data.albums
 
     # Create entity for random favorite image
     async_add_entities([ImmichImageFavorite(hass, hub)])
@@ -44,17 +45,10 @@ async def async_setup_entry(
             ImmichImageAlbum(
                 hass, hub, album_id=album["id"], album_name=album["albumName"]
             )
-            for album in await hub.list_all_albums()
+            for album in albums
             if album["id"] in watched_albums
         ]
     )
-
-    config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
-
-
-async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
-    """Handle options updates."""
-    await hass.config_entries.async_reload(config_entry.entry_id)
 
 
 class BaseImmichImage(ImageEntity):
@@ -96,17 +90,18 @@ class BaseImmichImage(ImageEntity):
         """Get the asset id of the next image we want to display."""
         if (
             not self._available_asset_ids_last_updated
-            or (datetime.now() - self._available_asset_ids_last_updated)
+            or (dt_util.utcnow() - self._available_asset_ids_last_updated)
             > _ID_LIST_REFRESH_INTERVAL
         ):
             # If we don't have any available asset IDs yet, or the list is stale, refresh it
             _LOGGER.debug("Refreshing available asset IDs")
             self._cached_available_asset_ids = await self._refresh_available_asset_ids()
-            self._available_asset_ids_last_updated = datetime.now()
+            # An empty list is not kept for hours: Immich may just have restarted, or the album is being filled.
+            if self._cached_available_asset_ids:
+                self._available_asset_ids_last_updated = dt_util.utcnow()
 
         if not self._cached_available_asset_ids:
-            # If we still don't have any available asset IDs, that's a problem
-            _LOGGER.error("No assets are available")
+            _LOGGER.debug("No assets are available")
             return None
 
         # Select random item in list
@@ -115,36 +110,49 @@ class BaseImmichImage(ImageEntity):
         return random_asset
 
     async def _load_and_cache_next_image(self) -> None:
-        """Download and cache the image."""
-        asset_bytes = None
+        """Download and cache the next image; on any failure the previous image stays."""
+        try:
+            for _attempt in range(_MAX_ATTEMPTS):
+                asset_id = await self._get_next_asset_id()
 
-        while not asset_bytes:
-            asset_id = await self._get_next_asset_id()
+                if not asset_id:
+                    return
 
-            if not asset_id:
+                asset_bytes = await self.hub.download_asset(asset_id)
+
+                if not asset_bytes:
+                    # Not a picture Home Assistant can show (HEIC, WebP...): try another one.
+                    continue
+
+                await self._set_asset_attributes(asset_id)
+
+                self._current_image_bytes = asset_bytes
+                self._attr_image_last_updated = dt_util.utcnow()
+                self.async_write_ha_state()
                 return
 
-            asset_bytes = await self.hub.download_asset(asset_id)
+            _LOGGER.warning("No usable picture after %d tries; keeping the current one", _MAX_ATTEMPTS)
+        except HomeAssistantError as error:
+            # Immich unreachable or refusing: keep showing the last picture instead of failing the update.
+            _LOGGER.warning("Could not refresh the Immich picture: %s", error)
 
-            if not asset_bytes:
-                await asyncio.sleep(1)
-                continue
+    async def _set_asset_attributes(self, asset_id: str) -> None:
+        """The picture's file name, date and metadata as attributes; the picture shows without them."""
+        try:
+            asset_info = await self.hub.get_asset_info(asset_id) or {}
+        except HomeAssistantError as error:
+            _LOGGER.debug("No metadata for %s: %s", asset_id, error)
+            asset_info = {}
 
-            asset_info = await self.hub.get_asset_info(asset_id)
-
-            self._attr_extra_state_attributes["media_filename"] = (
-                asset_info.get("originalFileName") or ""
-            )
-            self._attr_extra_state_attributes["media_exif"] = (
-                asset_info.get("exifInfo") or ""
-            )
-            self._attr_extra_state_attributes["media_localdatetime"] = (
-                asset_info.get("localDateTime") or ""
-            )
-
-            self._current_image_bytes = asset_bytes
-            self._attr_image_last_updated = datetime.now()
-            self.async_write_ha_state()
+        self._attr_extra_state_attributes["media_filename"] = (
+            asset_info.get("originalFileName") or ""
+        )
+        self._attr_extra_state_attributes["media_exif"] = (
+            asset_info.get("exifInfo") or ""
+        )
+        self._attr_extra_state_attributes["media_localdatetime"] = (
+            asset_info.get("localDateTime") or ""
+        )
 
 
 class ImmichImageFavorite(BaseImmichImage):

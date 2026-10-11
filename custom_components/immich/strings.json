@@ -6,6 +6,13 @@
           "host": "[%key:common::config_flow::data::host%]",
           "api_key": "[%key:common::config_flow::data::api_key%]"
         }
+      },
+      "reauth_confirm": {
+        "title": "Immich needs a new API key",
+        "description": "Immich did not accept the stored API key. Enter a new one.",
+        "data": {
+          "api_key": "[%key:common::config_flow::data::api_key%]"
+        }
       }
     },
     "error": {
@@ -14,7 +21,8 @@
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
     }
   },
   "options": {
@@ -24,6 +32,10 @@
           "watched_albums": "Albums for which entities will be created"
         }
       }
+    },
+    "abort": {
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
     }
   }
 }
