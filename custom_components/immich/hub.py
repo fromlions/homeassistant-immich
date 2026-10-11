@@ -159,24 +159,43 @@ class ImmichHub:
     async def list_album_images(self, album_id: str) -> list[dict]:
         """List all images in an album."""
         try:
+            # Immich v3 removed the embedded asset list from /api/albums/{id}, leaving only
+            # metadata and assetCount. Album contents come from the search endpoint instead.
             async with aiohttp.ClientSession() as session:
-                url = urljoin(self.host, f"/api/albums/{album_id}")
-                headers = {"Accept": "application/json", _HEADER_API_KEY: self.api_key}
+                url = urljoin(self.host, "/api/search/metadata")
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    _HEADER_API_KEY: self.api_key,
+                }
 
-                async with session.get(url=url, headers=headers) as response:
-                    if response.status != 200:
-                        raw_result = await response.text()
-                        _LOGGER.error("Error from API: body=%s", raw_result)
-                        raise ApiError()
+                filtered_assets: list[dict] = []
+                page: int | None = 1
 
-                    album_info: dict = await response.json()
-                    assets: list[dict] = album_info["assets"]
+                while page:
+                    body = {"albumIds": [album_id], "size": 1000, "page": page}
 
-                    filtered_assets: list[dict] = [
-                        asset for asset in assets if asset["type"] == "IMAGE"
-                    ]
+                    async with session.post(
+                        url=url, headers=headers, json=body
+                    ) as response:
+                        if response.status != 200:
+                            raw_result = await response.text()
+                            _LOGGER.error("Error from API: body=%s", raw_result)
+                            raise ApiError()
 
-                    return filtered_assets
+                        search_result: dict = await response.json()
+                        assets_page: dict = search_result.get("assets", {})
+
+                        filtered_assets.extend(
+                            asset
+                            for asset in assets_page.get("items", [])
+                            if asset.get("type") == "IMAGE"
+                        )
+
+                        next_page = assets_page.get("nextPage")
+                        page = int(next_page) if next_page else None
+
+                return filtered_assets
         except aiohttp.ClientError as exception:
             _LOGGER.error("Error connecting to the API: %s", exception)
             raise CannotConnect from exception
