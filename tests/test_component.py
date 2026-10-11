@@ -3,6 +3,7 @@ import asyncio
 import json
 import sys
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -257,7 +258,7 @@ class FakeHub:
 
 class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
     def entity(self, hub):
-        return image.ImmichImageFavorite(object(), hub)
+        return image.ImmichImageFavorite(object(), hub, timedelta(minutes=5))
 
     async def test_a_picture_is_shown_with_its_metadata(self):
         entity = self.entity(FakeHub(info={"originalFileName": "cat.jpg", "localDateTime": "2026-01-01"},
@@ -275,26 +276,26 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
     async def test_unusable_pictures_stop_after_the_attempt_cap_and_keep_the_previous_one(self):
         hub = FakeHub(ids=("a", "b", "c"), downloads=((b"first", "image/jpeg"), None, None, None), info={})
         entity = self.entity(hub)
-        await entity.async_update()
+        await entity._async_refresh(None)
         self.assertEqual(b"first", entity._current_image_bytes)
         hub.download_calls = 1
-        await entity.async_update()
+        await entity._async_refresh(None)
         self.assertEqual(b"first", entity._current_image_bytes)
         self.assertEqual(1 + image._MAX_ATTEMPTS, hub.download_calls)
 
     async def test_an_unreachable_immich_keeps_the_previous_picture(self):
         hub = FakeHub(info={})
         entity = self.entity(hub)
-        await entity.async_update()
+        await entity._async_refresh(None)
         hub.error = CannotConnect("down")
-        await entity.async_update()  # no exception
+        await entity._async_refresh(None)  # no exception
         self.assertEqual(b"img", entity._current_image_bytes)
 
     async def test_nothing_matching_keeps_the_entity_empty_and_asks_again_next_time(self):
         hub = FakeHub(ids=())
         entity = self.entity(hub)
-        await entity.async_update()
-        await entity.async_update()
+        await entity._async_refresh(None)
+        await entity._async_refresh(None)
         self.assertEqual(2, len(hub.random_calls))
         self.assertIsNone(entity._current_image_bytes)
         self.assertEqual(0, hub.download_calls)
@@ -302,13 +303,13 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
     async def test_every_refresh_asks_immich_for_new_random_pictures(self):
         hub = FakeHub(ids=("a", "b", "c", "d"), info={})
         entity = self.entity(hub)
-        await entity.async_update()
-        await entity.async_update()
+        await entity._async_refresh(None)
+        await entity._async_refresh(None)
         self.assertEqual([({"isFavorite": True}, image._MAX_ATTEMPTS)] * 2, hub.random_calls)
 
     async def test_an_album_entity_filters_on_its_album(self):
         hub = FakeHub(info={})
-        await image.ImmichImageAlbum(object(), hub, "album-1", "Holidays").async_update()
+        await image.ImmichImageAlbum(object(), hub, timedelta(minutes=5), "album-1", "Holidays")._async_refresh(None)
         self.assertEqual([({"albumIds": ["album-1"]}, image._MAX_ATTEMPTS)], hub.random_calls)
 
 

@@ -1,20 +1,20 @@
 """Image device for Immich integration."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from . import ImmichConfigEntry
 from .const import CONF_WATCHED_ALBUMS
 from .hub import ImmichHub
-
-SCAN_INTERVAL = timedelta(minutes=5)
+from .options import refresh_interval
 
 # Random pictures asked for, and so tried, in one refresh before it gives up and the entity keeps the previous one.
 _MAX_ATTEMPTS = 3
@@ -31,16 +31,17 @@ async def async_setup_entry(
 
     hub = config_entry.runtime_data.hub
     albums = config_entry.runtime_data.albums
+    interval = refresh_interval(config_entry.options)
 
     # Create entity for random favorite image
-    async_add_entities([ImmichImageFavorite(hass, hub)])
+    async_add_entities([ImmichImageFavorite(hass, hub, interval)])
 
     # Create entities for random image from each watched album
     watched_albums = config_entry.options.get(CONF_WATCHED_ALBUMS, [])
     async_add_entities(
         [
             ImmichImageAlbum(
-                hass, hub, album_id=album["id"], album_name=album["albumName"]
+                hass, hub, interval, album_id=album["id"], album_name=album["albumName"]
             )
             for album in albums
             if album["id"] in watched_albums
@@ -53,21 +54,28 @@ class BaseImmichImage(ImageEntity):
 
     _attr_has_entity_name = True
 
-    # We want to get a new image every so often, as defined by the refresh interval
-    _attr_should_poll = True
+    # Home Assistant's polling interval is one per platform, set by the code and not by an entry's options, so
+    # the entity runs its own timer for the interval the user chose.
+    _attr_should_poll = False
 
     _current_image_bytes: bytes | None = None
 
-    def __init__(self, hass: HomeAssistant, hub: ImmichHub) -> None:
+    def __init__(self, hass: HomeAssistant, hub: ImmichHub, interval: timedelta) -> None:
         """Initialize the Immich image entity."""
         super().__init__(hass=hass, verify_ssl=True)
         self.hub = hub
+        self._interval = interval
         self.hass = hass
 
         self._attr_extra_state_attributes = {}
 
-    async def async_update(self) -> None:
-        """Force a refresh of the image."""
+    async def async_added_to_hass(self) -> None:
+        """Start the refresh timer; it stops with the entity, which a changed option reloads."""
+        await super().async_added_to_hass()
+        self.async_on_remove(async_track_time_interval(self.hass, self._async_refresh, self._interval))
+
+    async def _async_refresh(self, _now: datetime) -> None:
+        """The timer's action."""
         await self._load_and_cache_next_image()
 
     async def async_image(self) -> bytes | None:
@@ -148,10 +156,10 @@ class ImmichImageAlbum(BaseImmichImage):
     """Image entity for Immich that displays a random image from a specific album."""
 
     def __init__(
-        self, hass: HomeAssistant, hub: ImmichHub, album_id: str, album_name: str
+        self, hass: HomeAssistant, hub: ImmichHub, interval: timedelta, album_id: str, album_name: str
     ) -> None:
         """Initialize the Immich image entity."""
-        super().__init__(hass, hub)
+        super().__init__(hass, hub, interval)
         self._album_id = album_id
         self._attr_unique_id = album_id
         self._attr_name = f"Immich: {album_name}"

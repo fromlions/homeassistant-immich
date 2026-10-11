@@ -55,9 +55,25 @@ class ImageEntity:
 
     def __init__(self, hass, verify_ssl=False):
         self.hass = hass
+        self.on_remove = []
+
+    async def async_added_to_hass(self):
+        pass
+
+    def async_on_remove(self, func):
+        self.on_remove.append(func)
 
     def async_write_ha_state(self):
         pass
+
+
+TIMERS = []  # (hass, action, interval, cancelled) of every async_track_time_interval call
+
+
+def async_track_time_interval(hass, action, interval, *, name=None, cancel_on_shutdown=None):
+    timer = {"hass": hass, "action": action, "interval": interval, "cancelled": False}
+    TIMERS.append(timer)
+    return lambda: timer.update(cancelled=True)
 
 
 def install():
@@ -70,6 +86,7 @@ def install():
     module("homeassistant.helpers")
     module("homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda hass: SESSION)
     module("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
+    module("homeassistant.helpers.event", async_track_time_interval=async_track_time_interval)
     module("homeassistant.components")
     module("homeassistant.components.image", ImageEntity=ImageEntity)
     module("homeassistant.util")

@@ -9,6 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .hub import ApiError, CannotConnect, ImmichHub
+from .options import image_size
 
 PLATFORMS: list[Platform] = [Platform.IMAGE]
 
@@ -27,7 +28,12 @@ type ImmichConfigEntry = ConfigEntry[ImmichData]
 async def async_setup_entry(hass: HomeAssistant, entry: ImmichConfigEntry) -> bool:
     """Set up immich from a config entry."""
 
-    hub = ImmichHub(hass, host=entry.data[CONF_HOST], api_key=entry.data[CONF_API_KEY])
+    hub = ImmichHub(
+        hass,
+        host=entry.data[CONF_HOST],
+        api_key=entry.data[CONF_API_KEY],
+        image_size=image_size(entry.options),
+    )
 
     # Everything that can fail because Immich is not there yet happens here, not in the platform: Home
     # Assistant retries a ConfigEntryNotReady raised in async_setup_entry with a growing delay, but not one

@@ -11,13 +11,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .const import DEFAULT_IMAGE_SIZE
+
 _HEADER_API_KEY = "x-api-key"
 _LOGGER = logging.getLogger(__name__)
 
 # Immich serves previews as JPEG, or WebP when its image settings say so.
 _ALLOWED_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"]
-# A dashboard frame needs about 1440 px; the original can be tens of megabytes (and HEIC or RAW).
-_PICTURE_SIZE = "preview"
 # Seconds one request may take in total; Immich answers in well under this unless it is stuck.
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Bytes of an error body worth logging.
@@ -35,13 +35,17 @@ def normalize_host(host: str) -> str:
 class ImmichHub:
     """Immich API hub."""
 
-    def __init__(self, hass: HomeAssistant, host: str, api_key: str) -> None:
+    def __init__(
+        self, hass: HomeAssistant, host: str, api_key: str, image_size: str = DEFAULT_IMAGE_SIZE
+    ) -> None:
         """Initialize."""
         # Home Assistant's shared session: it is closed by Home Assistant, and reuses connections.
         self._session = async_get_clientsession(hass)
         # No trailing slash: a path prefix of a reverse proxy (https://host/immich) is kept.
         self.host = normalize_host(host)
         self.api_key = api_key
+        # Which thumbnail size download_asset fetches; set from the options.
+        self.image_size = image_size
 
     async def _call(
         self, method: str, path: str, body: dict | None = None, accept: str = "application/json"
@@ -98,10 +102,10 @@ class ImmichHub:
         return await self._json("GET", f"/api/assets/{asset_id}")
 
     async def download_asset(self, asset_id: str) -> tuple[bytes, str] | None:
-        """The asset's preview picture and its content type; None when Immich refuses it or it is not a picture
+        """The asset's picture in the configured size and its content type; None when Immich refuses it or it is not a picture
         Home Assistant can show."""
         status, data, content_type = await self._call(
-            "GET", f"/api/assets/{asset_id}/thumbnail?size={_PICTURE_SIZE}", accept="*/*"
+            "GET", f"/api/assets/{asset_id}/thumbnail?size={self.image_size}", accept="*/*"
         )
         if status != 200:
             _LOGGER.error("Error from API: status=%d", status)
