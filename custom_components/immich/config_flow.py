@@ -6,18 +6,17 @@ import logging
 from typing import Any
 from urllib.parse import urlparse
 
-from url_normalize import url_normalize
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.const import CONF_API_KEY, CONF_HOST
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
 from .const import CONF_WATCHED_ALBUMS, DOMAIN
-from .hub import CannotConnect, ImmichHub, InvalidAuth
+from .hub import CannotConnect, ImmichHub, InvalidAuth, normalize_host
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
 
-    url = url_normalize(data[CONF_HOST])
+    url = normalize_host(data[CONF_HOST])
     api_key = data[CONF_API_KEY]
 
     hub = ImmichHub(hass, host=url, api_key=api_key)
@@ -61,7 +60,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -81,13 +80,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
 
-    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> ConfigFlowResult:
         """Immich refused the API key: ask for a new one."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Take the new API key for the same host."""
         errors: dict[str, str] = {}
         entry = self._get_reauth_entry()
@@ -128,13 +127,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
         # Get a connection to the hub in order to list the available albums
-        url = url_normalize(self.config_entry.data[CONF_HOST])
+        url = normalize_host(self.config_entry.data[CONF_HOST])
         api_key = self.config_entry.data[CONF_API_KEY]
         hub = ImmichHub(self.hass, host=url, api_key=api_key)
 

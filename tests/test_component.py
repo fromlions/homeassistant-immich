@@ -1,5 +1,6 @@
 """The Immich hub against a local aiohttp server, and the setup and image entity logic."""
 import asyncio
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ from custom_components.immich import (  # noqa: E402
     hub as hub_module,
     image,
 )
-from custom_components.immich.hub import ApiError, CannotConnect, ImmichHub  # noqa: E402
+from custom_components.immich.hub import ApiError, CannotConnect, ImmichHub, normalize_host  # noqa: E402
 
 CONFIG_ENTRY = ha_stubs.ConfigEntry
 KEY = "secret"
@@ -44,7 +45,7 @@ class FakeImmich:
         p = self.prefix
         app.router.add_post(p + "/api/auth/validateToken", self.validate)
         app.router.add_post(p + "/api/search/metadata", self.search)
-        app.router.add_get(p + "/api/assets/{id}/original", self.download)
+        app.router.add_get(p + "/api/assets/{id}/thumbnail", self.download)
         app.router.add_get(p + "/api/albums", self.albums)
         return app
 
@@ -64,6 +65,7 @@ class FakeImmich:
         return web.json_response({"assets": assets})
 
     async def download(self, request):
+        self.requests.append(("thumbnail", request.query.get("size")))
         status, data, content_type = self.original
         return web.Response(status=status, body=data, content_type=content_type)
 
@@ -136,8 +138,11 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         self.hub = ImmichHub(object(), self.host + "/", KEY)  # a trailing slash does not double up
         self.assertTrue(await self.hub.authenticate())
 
-    async def test_download_returns_bytes_and_none_for_refusals_and_unsupported_types(self):
-        self.assertEqual(b"jpeg-bytes", await self.hub.download_asset(ASSET))
+    async def test_download_returns_the_preview_and_none_for_refusals_and_unsupported_types(self):
+        self.assertEqual((b"jpeg-bytes", "image/jpeg"), await self.hub.download_asset(ASSET))
+        self.assertEqual(("thumbnail", "preview"), self.fake.requests[-1])  # not the original, which can be huge
+        self.fake.original = (200, b"webp-bytes", "image/webp")  # Immich can be set to WebP previews
+        self.assertEqual((b"webp-bytes", "image/webp"), await self.hub.download_asset(ASSET))
         self.fake.original = (404, b"", "application/json")
         self.assertIsNone(await self.hub.download_asset(ASSET))
         self.fake.original = (200, b"heic", "image/heic")
@@ -157,6 +162,20 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(hub_module, "_TIMEOUT", aiohttp.ClientTimeout(total=0.1)):
             with self.assertRaises(CannotConnect):
                 await self.hub.authenticate()
+
+
+class HostAndManifestTest(unittest.TestCase):
+    def test_a_host_gets_a_scheme_and_loses_the_trailing_slash(self):
+        for given, expected in (("immich.local:2283", "http://immich.local:2283"), (" http://192.168.1.5:2283/ ", "http://192.168.1.5:2283"),
+                                ("https://photos.example.com/immich/", "https://photos.example.com/immich")):
+            self.assertEqual(expected, normalize_host(given), given)
+
+    def test_the_manifest_has_no_requirements_and_points_at_this_repository(self):
+        manifest = json.loads((Path(__file__).resolve().parents[1] / "custom_components" / "immich" / "manifest.json").read_text())
+        self.assertEqual([], manifest["requirements"])
+        self.assertIn("fromlions/homeassistant-immich", manifest["documentation"])
+        self.assertEqual("local_polling", manifest["iot_class"])
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
 
 
 class SetupTest(unittest.IsolatedAsyncioTestCase):
@@ -206,7 +225,7 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeHub:
-    def __init__(self, ids=("a",), downloads=(b"img",), info=None, error=None):
+    def __init__(self, ids=("a",), downloads=((b"img", "image/jpeg"),), info=None, error=None):
         self.ids, self.downloads, self.info, self.error = list(ids), list(downloads), info, error
         self.download_calls = 0
         self.list_calls = 0
@@ -234,8 +253,10 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         return image.ImmichImageFavorite(object(), hub)
 
     async def test_a_picture_is_shown_with_its_metadata(self):
-        entity = self.entity(FakeHub(info={"originalFileName": "cat.jpg", "localDateTime": "2026-01-01"}))
+        entity = self.entity(FakeHub(info={"originalFileName": "cat.jpg", "localDateTime": "2026-01-01"},
+                                     downloads=((b"img", "image/webp"),)))
         self.assertEqual(b"img", await entity.async_image())
+        self.assertEqual("image/webp", entity._attr_content_type)  # served as what Immich sent
         self.assertEqual("cat.jpg", entity._attr_extra_state_attributes["media_filename"])
         self.assertIsNotNone(entity._attr_image_last_updated.tzinfo)
 
@@ -245,7 +266,7 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", entity._attr_extra_state_attributes["media_filename"])
 
     async def test_unusable_pictures_stop_after_the_attempt_cap_and_keep_the_previous_one(self):
-        hub = FakeHub(downloads=(b"first", None, None, None), info={})
+        hub = FakeHub(downloads=((b"first", "image/jpeg"), None, None, None), info={})
         entity = self.entity(hub)
         await entity.async_update()
         self.assertEqual(b"first", entity._current_image_bytes)
