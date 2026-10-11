@@ -157,11 +157,6 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         self.fake.original = (200, b"heic", "image/heic")
         self.assertIsNone(await self.hub.download_asset(ASSET))
 
-    async def test_download_asks_for_the_configured_size(self):
-        full = ImmichHub(object(), self.host, KEY, image_size="fullsize")
-        await full.download_asset(ASSET)
-        self.assertEqual(("thumbnail", "fullsize"), self.fake.requests[-1])
-
     async def test_a_non_json_answer_is_an_api_error(self):
         with self.assertRaises(ApiError):
             await self.hub.list_all_albums()
@@ -194,18 +189,14 @@ class HostAndManifestTest(unittest.TestCase):
 
 class OptionsTest(unittest.TestCase):
     def test_nothing_set_gives_the_defaults(self):
-        self.assertEqual("preview", options.image_size({}))
         self.assertEqual(5, options.refresh_minutes({}))
         self.assertEqual(timedelta(minutes=5), options.refresh_interval({"watched_albums": []}))
 
     def test_set_values_are_used(self):
-        given = {"image_size": "fullsize", "refresh_interval": 30}
-        self.assertEqual("fullsize", options.image_size(given))
-        self.assertEqual(timedelta(minutes=30), options.refresh_interval(given))
+        self.assertEqual(timedelta(minutes=30), options.refresh_interval({"refresh_interval": 30}))
         self.assertEqual(30, options.refresh_minutes({"refresh_interval": 30.0}))  # a number selector gives floats
 
     def test_values_outside_the_allowed_range_or_kind_fall_back_or_clamp(self):
-        self.assertEqual("preview", options.image_size({"image_size": "original"}))  # not offered
         self.assertEqual(1, options.refresh_minutes({"refresh_interval": 0}))
         self.assertEqual(1440, options.refresh_minutes({"refresh_interval": 100000}))
         self.assertEqual(5, options.refresh_minutes({"refresh_interval": "soon"}))
@@ -215,15 +206,13 @@ class OptionsTest(unittest.TestCase):
 class StringsTest(unittest.TestCase):
     root = Path(__file__).resolve().parents[1] / "custom_components" / "immich"
 
-    def test_strings_and_english_translation_agree_on_options_selectors_and_services(self):
+    def test_strings_and_english_translation_agree_on_options_and_services(self):
         strings = json.loads((self.root / "strings.json").read_text(encoding="utf8"))
         english = json.loads((self.root / "translations" / "en.json").read_text(encoding="utf8"))
-        for key in ("watched_albums", "image_size", "refresh_interval"):
+        for key in ("watched_albums", "refresh_interval"):
             self.assertIn(key, strings["options"]["step"]["init"]["data"])
         self.assertEqual(strings["options"]["step"]["init"], english["options"]["step"]["init"])
-        self.assertEqual(strings["selector"], english["selector"])
         self.assertEqual(strings["services"], english["services"])
-        self.assertEqual({"preview", "fullsize"}, set(strings["selector"]["image_size"]["options"]))
 
     def test_the_service_is_described_in_services_yaml(self):
         self.assertRegex((self.root / "services.yaml").read_text(encoding="utf8"), r"(?m)^next_image:")
@@ -265,13 +254,6 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(albums, entry.runtime_data.albums)
         self.assertEqual(1, len(entry.listeners))  # options changes reload the entry
         hass.config_entries.async_forward_entry_setups.assert_awaited_once()
-
-    async def test_the_hub_gets_the_picture_size_from_the_options(self):
-        for given, expected in (({}, "preview"), ({"image_size": "fullsize"}, "fullsize")):
-            entry = CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY}, options=given)
-            with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True),                     mock.patch("custom_components.immich.ImmichHub.list_all_albums", return_value=[]):
-                await async_setup_entry(self.hass(), entry)
-            self.assertEqual(expected, entry.runtime_data.hub.image_size)
 
     async def test_the_platform_hands_the_chosen_interval_to_every_entity_and_registers_the_service_once_per_setup(self):
         albums = [{"id": "x", "albumName": "Holidays"}]

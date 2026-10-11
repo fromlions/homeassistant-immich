@@ -18,22 +18,17 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
-    SelectSelector,
-    SelectSelectorConfig,
-    SelectSelectorMode,
 )
 
 from .const import (
-    CONF_IMAGE_SIZE,
     CONF_REFRESH_INTERVAL,
     CONF_WATCHED_ALBUMS,
     DOMAIN,
-    IMAGE_SIZES,
     MAX_REFRESH_INTERVAL,
     MIN_REFRESH_INTERVAL,
 )
 from .hub import CannotConnect, ImmichHub, InvalidAuth, normalize_host
-from .options import image_size, refresh_minutes
+from .options import refresh_minutes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -179,16 +174,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_WATCHED_ALBUMS,
                         default=current_albums_value,
                     ): cv.multi_select(album_map),
-                    vol.Required(
-                        CONF_IMAGE_SIZE,
-                        default=image_size(self.config_entry.options),
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=IMAGE_SIZES,
-                            mode=SelectSelectorMode.DROPDOWN,
-                            translation_key=CONF_IMAGE_SIZE,
-                        )
-                    ),
                     vol.Required(
                         CONF_REFRESH_INTERVAL,
                         default=refresh_minutes(self.config_entry.options),

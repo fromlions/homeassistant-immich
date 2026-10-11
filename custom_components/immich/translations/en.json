@@ -30,11 +30,9 @@
             "init": {
                 "data": {
                     "watched_albums": "Albums for which entities will be created",
-                    "image_size": "Picture size",
                     "refresh_interval": "New picture every (minutes)"
                 },
                 "data_description": {
-                    "image_size": "Preview is about 1440 pixels wide and loads fast. Full size is the whole picture converted to a web format and can be several megabytes.",
                     "refresh_interval": "How often every picture entity loads a new random picture, from 1 minute to 24 hours."
                 }
             }
@@ -42,14 +40,6 @@
         "abort": {
             "invalid_auth": "Invalid authentication",
             "cannot_connect": "Failed to connect"
-        }
-    },
-    "selector": {
-        "image_size": {
-            "options": {
-                "preview": "Preview (recommended)",
-                "fullsize": "Full size"
-            }
         }
     },
     "services": {
