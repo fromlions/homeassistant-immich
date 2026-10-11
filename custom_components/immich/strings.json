@@ -29,13 +29,23 @@
     "step": {
       "init": {
         "data": {
-          "watched_albums": "Albums for which entities will be created"
+          "watched_albums": "Albums for which entities will be created",
+          "refresh_interval": "New picture every (minutes)"
+        },
+        "data_description": {
+          "refresh_interval": "How often every picture entity loads a new random picture, from 1 minute to 24 hours."
         }
       }
     },
     "abort": {
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    }
+  },
+  "services": {
+    "next_image": {
+      "name": "Next image",
+      "description": "Loads the next random picture now, without waiting for the refresh interval."
     }
   }
 }

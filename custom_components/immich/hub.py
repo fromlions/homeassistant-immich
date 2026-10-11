@@ -16,11 +16,12 @@ _LOGGER = logging.getLogger(__name__)
 
 # Immich serves previews as JPEG, or WebP when its image settings say so.
 _ALLOWED_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"]
-# A dashboard frame needs about 1440 px; the original can be tens of megabytes (and HEIC or RAW).
+# Immich's "preview" is about 1440 px, enough for a dashboard frame. "fullsize" is not a smaller original: for a JPEG,
+# PNG or WebP original Immich redirects to the original file (often 10 to 20 MB), and it falls back to the
+# preview when it generates no fullsize pictures. "original" is refused for the thumbnail endpoint.
 _PICTURE_SIZE = "preview"
 # Seconds one request may take in total; Immich answers in well under this unless it is stuck.
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
-_PAGE_SIZE = 1000
 # Bytes of an error body worth logging.
 _LOGGED_BODY = 500
 
@@ -96,7 +97,11 @@ class ImmichHub:
 
     async def get_asset_info(self, asset_id: str) -> dict | None:
         """Get asset info."""
-        return await self._json("GET", f"/api/assets/{asset_id}")
+        info = await self._json("GET", f"/api/assets/{asset_id}")
+        if not isinstance(info, dict):
+            _LOGGER.error("Error from API: asset info is not an object")
+            raise ApiError()
+        return info
 
     async def download_asset(self, asset_id: str) -> tuple[bytes, str] | None:
         """The asset's preview picture and its content type; None when Immich refuses it or it is not a picture
@@ -112,35 +117,25 @@ class ImmichHub:
             return None
         return data, content_type
 
-    async def list_favorite_images(self) -> list[dict]:
-        """List all favorite images."""
-        return await self._search_images({"isFavorite": True})
-
     async def list_all_albums(self) -> list[dict]:
         """List all albums."""
         return await self._json("GET", "/api/albums")
 
-    async def list_album_images(self, album_id: str) -> list[dict]:
-        """List all images in an album."""
-        # Immich v3 removed the embedded asset list from /api/albums/{id}, leaving only
-        # metadata and assetCount. Album contents come from the search endpoint instead.
-        return await self._search_images({"albumIds": [album_id]})
-
-    async def _search_images(self, criteria: dict) -> list[dict]:
-        """Every image matching the search criteria, page by page. The body goes as JSON: Immich v3
-        validates the types, so a boolean sent as the string "true" is refused."""
-        images: list[dict] = []
-        page: int | None = 1
-        while page:
-            body = dict(criteria, size=_PAGE_SIZE, page=page)
-            result = await self._json("POST", "/api/search/metadata", body)
-            assets_page = result.get("assets", {})
-            images.extend(
-                asset for asset in assets_page.get("items", []) if asset.get("type") == "IMAGE"
-            )
-            next_page = assets_page.get("nextPage")
-            page = int(next_page) if next_page else None
-        return images
+    async def random_images(self, criteria: dict, count: int) -> list[dict]:
+        """Up to `count` random images matching the search criteria, picked by Immich itself, so the whole
+        library is never listed. The body goes as JSON: Immich v3 validates the types, so a boolean sent as
+        the string "true" is refused. An empty list means nothing matches (yet)."""
+        body = dict(criteria, size=count, type="IMAGE", withExif=False)
+        result = await self._json("POST", "/api/search/random", body)
+        if not isinstance(result, list):
+            _LOGGER.error("Error from API: random search did not answer with a list")
+            raise ApiError()
+        # An item that is not an image with an id is skipped rather than failing the whole refresh.
+        return [
+            asset
+            for asset in result
+            if isinstance(asset, dict) and asset.get("type") == "IMAGE" and isinstance(asset.get("id"), str)
+        ]
 
 
 class CannotConnect(HomeAssistantError):

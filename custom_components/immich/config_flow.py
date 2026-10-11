@@ -14,9 +14,21 @@ from homeassistant.const import CONF_API_KEY, CONF_HOST
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
-from .const import CONF_WATCHED_ALBUMS, DOMAIN
+from .const import (
+    CONF_REFRESH_INTERVAL,
+    CONF_WATCHED_ALBUMS,
+    DOMAIN,
+    MAX_REFRESH_INTERVAL,
+    MIN_REFRESH_INTERVAL,
+)
 from .hub import CannotConnect, ImmichHub, InvalidAuth, normalize_host
+from .options import refresh_minutes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -161,7 +173,22 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Required(
                         CONF_WATCHED_ALBUMS,
                         default=current_albums_value,
-                    ): cv.multi_select(album_map)
+                    ): cv.multi_select(album_map),
+                    vol.Required(
+                        CONF_REFRESH_INTERVAL,
+                        default=refresh_minutes(self.config_entry.options),
+                    ): vol.All(
+                        NumberSelector(
+                            NumberSelectorConfig(
+                                min=MIN_REFRESH_INTERVAL,
+                                max=MAX_REFRESH_INTERVAL,
+                                step=1,
+                                mode=NumberSelectorMode.BOX,
+                                unit_of_measurement="min",
+                            )
+                        ),
+                        vol.Coerce(int),
+                    ),
                 }
             ),
         )

@@ -3,6 +3,7 @@ import asyncio
 import json
 import sys
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -16,10 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ha_stubs  # noqa: E402  must come before the component
 
 from custom_components.immich import (  # noqa: E402
+    config_flow,
     ImmichData,
+    CONFIG_SCHEMA,
+    async_setup,
     async_setup_entry,
     hub as hub_module,
     image,
+    options,
 )
 from custom_components.immich.hub import ApiError, CannotConnect, ImmichHub, normalize_host  # noqa: E402
 
@@ -35,7 +40,7 @@ class FakeImmich:
         self.prefix = prefix
         self.requests = []
         self.auth_status = True
-        self.pages = [[{"id": "a", "type": "IMAGE"}, {"id": "v", "type": "VIDEO"}], [{"id": "b", "type": "IMAGE"}]]
+        self.random_assets = [{"id": "a", "type": "IMAGE"}, {"id": "b", "type": "IMAGE"}]
         self.original = (200, b"jpeg-bytes", "image/jpeg")
         self.delay = 0
         self.validate_status = 200
@@ -44,7 +49,7 @@ class FakeImmich:
         app = web.Application()
         p = self.prefix
         app.router.add_post(p + "/api/auth/validateToken", self.validate)
-        app.router.add_post(p + "/api/search/metadata", self.search)
+        app.router.add_post(p + "/api/search/random", self.search)
         app.router.add_get(p + "/api/assets/{id}/thumbnail", self.download)
         app.router.add_get(p + "/api/albums", self.albums)
         return app
@@ -59,10 +64,7 @@ class FakeImmich:
     async def search(self, request):
         body = await request.json()
         self.requests.append(("search", body))
-        number = body["page"]
-        items = self.pages[number - 1]
-        assets = {"items": items, "nextPage": str(number + 1) if number < len(self.pages) else None}
-        return web.json_response({"assets": assets})
+        return web.json_response(self.random_assets)
 
     async def download(self, request):
         self.requests.append(("thumbnail", request.query.get("size")))
@@ -118,16 +120,30 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CannotConnect):
             await ImmichHub(object(), str(self.server.make_url("")), KEY).authenticate()
 
-    async def test_favorites_search_sends_json_booleans_and_follows_pages_and_drops_videos(self):
-        images = await self.hub.list_favorite_images()
+    async def test_random_search_sends_typed_json_and_asks_for_few_images_without_exif(self):
+        images = await self.hub.random_images({"isFavorite": True}, 3)
         self.assertEqual(["a", "b"], [i["id"] for i in images])
-        bodies = [r[1] for r in self.fake.requests if r[0] == "search"]
-        self.assertEqual([1, 2], [b["page"] for b in bodies])
-        self.assertIs(True, bodies[0]["isFavorite"])  # a real boolean: Immich v3 refuses the string "true"
+        self.assertEqual(1, len(self.fake.requests))  # one request: the library is never listed
+        body = self.fake.requests[0][1]
+        self.assertIs(True, body["isFavorite"])  # a real boolean: Immich v3 refuses the string "true"
+        self.assertEqual({"size": 3, "type": "IMAGE", "withExif": False}, {k: body[k] for k in ("size", "type", "withExif")})
 
-    async def test_album_search_sends_the_album_id_as_a_list(self):
-        await self.hub.list_album_images("album-1")
+    async def test_random_search_sends_the_album_id_as_a_list_and_drops_other_types(self):
+        self.fake.random_assets = [{"id": "a", "type": "IMAGE"}, {"id": "v", "type": "VIDEO"}]
+        images = await self.hub.random_images({"albumIds": ["album-1"]}, 3)
         self.assertEqual(["album-1"], self.fake.requests[0][1]["albumIds"])
+        self.assertEqual(["a"], [i["id"] for i in images])
+
+    async def test_random_search_skips_items_that_are_not_images_with_an_id(self):
+        self.fake.random_assets = [{"type": "IMAGE"}, "junk", None, {"id": 5, "type": "IMAGE"}, {"id": "ok", "type": "IMAGE"}]
+        self.assertEqual(["ok"], [i["id"] for i in await self.hub.random_images({}, 3)])
+
+    async def test_random_search_with_no_match_is_an_empty_list_and_a_non_list_is_an_api_error(self):
+        self.fake.random_assets = []
+        self.assertEqual([], await self.hub.random_images({}, 3))
+        self.fake.random_assets = {"assets": {}}
+        with self.assertRaises(ApiError):
+            await self.hub.random_images({}, 3)
 
     async def test_a_path_prefix_of_a_reverse_proxy_is_kept(self):
         await ha_stubs.SESSION.close()
@@ -178,6 +194,97 @@ class HostAndManifestTest(unittest.TestCase):
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
 
 
+class OptionsTest(unittest.TestCase):
+    def test_nothing_set_gives_the_defaults(self):
+        self.assertEqual(5, options.refresh_minutes({}))
+        self.assertEqual(timedelta(minutes=5), options.refresh_interval({"watched_albums": []}))
+
+    def test_set_values_are_used(self):
+        self.assertEqual(timedelta(minutes=30), options.refresh_interval({"refresh_interval": 30}))
+        self.assertEqual(30, options.refresh_minutes({"refresh_interval": 30.0}))  # a number selector gives floats
+
+    def test_values_outside_the_allowed_range_or_kind_fall_back_or_clamp(self):
+        self.assertEqual(1, options.refresh_minutes({"refresh_interval": 0}))
+        self.assertEqual(1440, options.refresh_minutes({"refresh_interval": 100000}))
+        self.assertEqual(5, options.refresh_minutes({"refresh_interval": "soon"}))
+        self.assertEqual(5, options.refresh_minutes({"refresh_interval": None}))
+
+
+class OptionsFlowTest(unittest.IsolatedAsyncioTestCase):
+    ALBUMS = [{"id": "x", "albumName": "Holidays"}, {"id": "y", "albumName": "Work"}]
+
+    async def form(self, options, albums=None):
+        flow = config_flow.OptionsFlowHandler()
+        flow.hass = object()
+        flow.config_entry = CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY}, options=options)
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True),                 mock.patch("custom_components.immich.ImmichHub.list_all_albums", return_value=albums or self.ALBUMS):
+            return flow, await flow.async_step_init()
+
+    async def test_an_entry_with_only_watched_albums_gets_the_defaults(self):
+        _flow, result = await self.form({"watched_albums": ["y"]})
+        self.assertEqual("form", result["type"])
+        saved = result["data_schema"]({})
+        self.assertEqual({"watched_albums": ["y"], "refresh_interval": 5}, saved)
+        self.assertIsInstance(saved["refresh_interval"], int)
+
+    async def test_an_entry_without_options_gets_no_albums_and_five_minutes(self):
+        _flow, result = await self.form({})
+        self.assertEqual({"watched_albums": [], "refresh_interval": 5}, result["data_schema"]({}))
+
+    async def test_stored_values_are_the_defaults_and_albums_that_are_gone_are_dropped(self):
+        _flow, result = await self.form({"watched_albums": ["x", "gone"], "refresh_interval": 30})
+        self.assertEqual({"watched_albums": ["x"], "refresh_interval": 30}, result["data_schema"]({}))
+
+    async def test_a_stored_interval_outside_the_range_is_shown_clamped(self):
+        _flow, result = await self.form({"refresh_interval": 100000})
+        self.assertEqual(1440, result["data_schema"]({})["refresh_interval"])
+        _flow, result = await self.form({"refresh_interval": 0})
+        self.assertEqual(1, result["data_schema"]({})["refresh_interval"])
+
+    async def test_the_form_accepts_one_to_1440_minutes_as_whole_numbers_and_refuses_the_rest(self):
+        import voluptuous
+        _flow, result = await self.form({})
+        schema = result["data_schema"]
+        for accepted in (1, 5.0, 1440):
+            saved = schema({"watched_albums": [], "refresh_interval": accepted})
+            self.assertEqual(int(accepted), saved["refresh_interval"])
+            self.assertIsInstance(saved["refresh_interval"], int)
+        for refused in (0, 1441, -3, "soon"):
+            with self.assertRaises(voluptuous.Invalid):
+                schema({"watched_albums": [], "refresh_interval": refused})
+        with self.assertRaises(voluptuous.Invalid):
+            schema({"watched_albums": ["unknown"]})
+
+    async def test_submitting_stores_the_input_as_the_options(self):
+        flow, _result = await self.form({})
+        result = await flow.async_step_init({"watched_albums": ["x"], "refresh_interval": 20})
+        self.assertEqual({"watched_albums": ["x"], "refresh_interval": 20}, result["data"])
+
+    async def test_a_refused_key_or_unreachable_immich_aborts_the_form(self):
+        flow = config_flow.OptionsFlowHandler()
+        flow.hass = object()
+        flow.config_entry = CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY})
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=False):
+            self.assertEqual("invalid_auth", (await flow.async_step_init())["reason"])
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", side_effect=CannotConnect("down")):
+            self.assertEqual("cannot_connect", (await flow.async_step_init())["reason"])
+
+
+class StringsTest(unittest.TestCase):
+    root = Path(__file__).resolve().parents[1] / "custom_components" / "immich"
+
+    def test_strings_and_english_translation_agree_on_options_and_services(self):
+        strings = json.loads((self.root / "strings.json").read_text(encoding="utf8"))
+        english = json.loads((self.root / "translations" / "en.json").read_text(encoding="utf8"))
+        for key in ("watched_albums", "refresh_interval"):
+            self.assertIn(key, strings["options"]["step"]["init"]["data"])
+        self.assertEqual(strings["options"]["step"]["init"], english["options"]["step"]["init"])
+        self.assertEqual(strings["services"], english["services"])
+
+    def test_the_service_is_described_in_services_yaml(self):
+        self.assertRegex((self.root / "services.yaml").read_text(encoding="utf8"), r"(?m)^next_image:")
+
+
 class SetupTest(unittest.IsolatedAsyncioTestCase):
     def entry(self):
         return CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY})
@@ -215,6 +322,33 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(entry.listeners))  # options changes reload the entry
         hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
+    async def test_the_service_is_registered_by_async_setup_not_by_the_entry(self):
+        ha_stubs.SERVICES.clear()
+        self.assertTrue(await async_setup(self.hass(), {}))
+        self.assertEqual([("immich", "next_image", "image", None, "async_next_image")], ha_stubs.SERVICES)
+        self.assertEqual(("schema", "immich"), CONFIG_SCHEMA)
+        # Setting an entry up, or failing to, registers nothing more or less.
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", side_effect=CannotConnect("down")):
+            with self.assertRaises(ha_stubs.ConfigEntryNotReady):
+                await async_setup_entry(self.hass(), self.entry())
+        self.assertEqual(1, len(ha_stubs.SERVICES))
+
+    async def test_the_platform_hands_the_chosen_interval_to_every_entity(self):
+        albums = [{"id": "x", "albumName": "Holidays"}]
+        entry = CONFIG_ENTRY(options={"watched_albums": ["x"], "refresh_interval": 15})
+        entry.runtime_data = ImmichData(FakeHub(), albums)
+        added = []
+        await image.async_setup_entry(object(), entry, added.extend)
+        self.assertEqual([timedelta(minutes=15)] * 2, [e._interval for e in added])
+        self.assertTrue(callable(image.BaseImmichImage.async_next_image))
+
+    async def test_names_and_unique_ids_stay_what_dashboards_are_bound_to(self):
+        favorite = image.ImmichImageFavorite(object(), FakeHub(), timedelta(minutes=5))
+        album = image.ImmichImageAlbum(object(), FakeHub(), timedelta(minutes=5), "album-id", "Screen saver")
+        self.assertEqual(("favorite_image", "Immich: Random favorite image"), (favorite._attr_unique_id, favorite._attr_name))
+        self.assertEqual(("album-id", "Immich: Screen saver"), (album._attr_unique_id, album._attr_name))
+        self.assertFalse(hasattr(favorite, "_attr_device_info"))
+
     async def test_the_image_platform_creates_the_favorite_and_the_watched_albums(self):
         albums = [{"id": "x", "albumName": "Holidays"}, {"id": "y", "albumName": "Work"}]
         entry = CONFIG_ENTRY(options={"watched_albums": ["y"]})
@@ -228,13 +362,13 @@ class FakeHub:
     def __init__(self, ids=("a",), downloads=((b"img", "image/jpeg"),), info=None, error=None):
         self.ids, self.downloads, self.info, self.error = list(ids), list(downloads), info, error
         self.download_calls = 0
-        self.list_calls = 0
+        self.random_calls = []
 
-    async def list_favorite_images(self):
-        self.list_calls += 1
+    async def random_images(self, criteria, count):
+        self.random_calls.append((criteria, count))
         if self.error:
             raise self.error
-        return [{"id": i} for i in self.ids]
+        return [{"id": i} for i in self.ids]  # no slicing: the entity itself must cap the attempts
 
     async def download_asset(self, asset_id):
         if self.error:
@@ -250,7 +384,7 @@ class FakeHub:
 
 class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
     def entity(self, hub):
-        return image.ImmichImageFavorite(object(), hub)
+        return image.ImmichImageFavorite(object(), hub, timedelta(minutes=5))
 
     async def test_a_picture_is_shown_with_its_metadata(self):
         entity = self.entity(FakeHub(info={"originalFileName": "cat.jpg", "localDateTime": "2026-01-01"},
@@ -266,38 +400,133 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", entity._attr_extra_state_attributes["media_filename"])
 
     async def test_unusable_pictures_stop_after_the_attempt_cap_and_keep_the_previous_one(self):
-        hub = FakeHub(downloads=((b"first", "image/jpeg"), None, None, None), info={})
+        hub = FakeHub(ids=tuple("abcdefgh"), downloads=((b"first", "image/jpeg"), None), info={})
         entity = self.entity(hub)
-        await entity.async_update()
+        await entity._async_refresh(None)
         self.assertEqual(b"first", entity._current_image_bytes)
         hub.download_calls = 1
-        await entity.async_update()
+        await entity._async_refresh(None)
         self.assertEqual(b"first", entity._current_image_bytes)
-        self.assertEqual(1 + image._MAX_ATTEMPTS, hub.download_calls)
+        self.assertEqual(1 + image._MAX_ATTEMPTS, hub.download_calls)  # eight ids on offer, three tried
 
     async def test_an_unreachable_immich_keeps_the_previous_picture(self):
         hub = FakeHub(info={})
         entity = self.entity(hub)
-        await entity.async_update()
+        await entity._async_refresh(None)
         hub.error = CannotConnect("down")
-        entity._available_asset_ids_last_updated = None
-        await entity.async_update()  # no exception
+        await entity._async_refresh(None)  # no exception
         self.assertEqual(b"img", entity._current_image_bytes)
 
-    async def test_an_empty_list_is_asked_for_again_next_time(self):
+    async def test_nothing_matching_keeps_the_entity_empty_and_asks_again_next_time(self):
         hub = FakeHub(ids=())
         entity = self.entity(hub)
-        await entity.async_update()
-        await entity.async_update()
-        self.assertEqual(2, hub.list_calls)
+        await entity._async_refresh(None)
+        await entity._async_refresh(None)
+        self.assertEqual(2, len(hub.random_calls))
         self.assertIsNone(entity._current_image_bytes)
+        self.assertEqual(0, hub.download_calls)
 
-    async def test_a_filled_list_is_kept_for_the_refresh_interval(self):
+    async def test_every_refresh_asks_immich_for_new_random_pictures(self):
+        hub = FakeHub(ids=("a", "b", "c", "d"), info={})
+        entity = self.entity(hub)
+        await entity._async_refresh(None)
+        await entity._async_refresh(None)
+        self.assertEqual([({"isFavorite": True}, image._MAX_ATTEMPTS)] * 2, hub.random_calls)
+
+    async def test_the_timer_runs_at_the_interval_loads_a_picture_and_stops_with_the_entity(self):
+        hub = FakeHub(info={})
+        entity = image.ImmichImageFavorite(object(), hub, timedelta(minutes=7))
+        ha_stubs.TIMERS.clear()
+        await entity.async_added_to_hass()
+        ha_stubs.TASKS.pop()[0].close()
+        (timer,) = ha_stubs.TIMERS
+        self.assertEqual(timedelta(minutes=7), timer["interval"])
+        self.assertFalse(entity._attr_should_poll)  # Home Assistant's own polling would add a second schedule
+        await timer["action"](None)
+        self.assertEqual(b"img", entity._current_image_bytes)
+        for remove in entity.on_remove:
+            remove()
+        self.assertTrue(timer["cancelled"])
+
+    async def test_next_image_loads_a_new_picture_now_and_a_failure_keeps_the_old_one(self):
+        hub = FakeHub(downloads=((b"one", "image/jpeg"), (b"two", "image/jpeg")), info={})
+        entity = self.entity(hub)
+        await entity.async_next_image()
+        self.assertEqual(b"one", entity._current_image_bytes)
+        await entity.async_next_image()
+        self.assertEqual(b"two", entity._current_image_bytes)
+        hub.error = CannotConnect("down")
+        await entity.async_next_image()  # no exception
+        self.assertEqual(b"two", entity._current_image_bytes)
+
+    async def test_the_first_picture_loads_in_the_background_when_the_entity_is_added(self):
         hub = FakeHub(info={})
         entity = self.entity(hub)
-        await entity.async_update()
-        await entity.async_update()
-        self.assertEqual(1, hub.list_calls)
+        ha_stubs.TASKS.clear()
+        await entity.async_added_to_hass()
+        ((target, name, eager_start),) = ha_stubs.TASKS
+        self.assertFalse(eager_start)  # the entity must be added before it writes state
+        self.assertIsNone(entity._current_image_bytes)
+        await target
+        self.assertEqual(b"img", entity._current_image_bytes)
+
+    async def test_a_tick_during_a_running_refresh_is_skipped_and_the_service_waits_for_it(self):
+        release = asyncio.Event()
+        hub = FakeHub(info={})
+        real = hub.random_images
+
+        async def blocked(criteria, count):
+            await release.wait()
+            return await real(criteria, count)
+
+        hub.random_images = blocked
+        entity = self.entity(hub)
+        ha_stubs.TIMERS.clear()
+        await entity.async_added_to_hass()
+        ha_stubs.TASKS.pop()[0].close()
+        (timer,) = ha_stubs.TIMERS
+        running = asyncio.create_task(ha_stubs.fire(timer))
+        await asyncio.sleep(0)
+        await ha_stubs.fire(timer)  # returns at once: skipped, not queued
+        self.assertFalse(running.done())
+        service = asyncio.create_task(entity.async_next_image())
+        image_request = asyncio.create_task(entity.async_image())
+        await asyncio.sleep(0)
+        self.assertFalse(service.done())
+        self.assertFalse(image_request.done())
+        release.set()
+        await asyncio.gather(running, service)
+        self.assertEqual(b"img", await image_request)
+        self.assertEqual(1, hub.download_calls)  # one refresh served all four callers
+
+    async def test_the_next_tick_after_a_finished_refresh_runs_again(self):
+        hub = FakeHub(info={})
+        entity = self.entity(hub)
+        ha_stubs.TIMERS.clear()
+        await entity.async_added_to_hass()
+        ha_stubs.TASKS.pop()[0].close()
+        (timer,) = ha_stubs.TIMERS
+        await ha_stubs.fire(timer)
+        await ha_stubs.fire(timer)
+        self.assertEqual(2, hub.download_calls)
+
+    async def test_malformed_search_results_are_skipped_and_do_not_escape(self):
+        entity = self.entity(FakeHub(info=[1, 2]))
+        entity.hub.random_images = mock.AsyncMock(return_value=[{"type": "IMAGE"}, "junk", None, {"id": "a"}])
+        await entity.async_next_image()
+        self.assertEqual(b"img", entity._current_image_bytes)
+        self.assertEqual("", entity._attr_extra_state_attributes["media_filename"])  # metadata that is no object
+        broken = self.entity(FakeHub())
+        broken.hub.random_images = mock.AsyncMock(return_value=[{"type": "IMAGE"}, 5])
+        self.assertIsNone(await broken.async_image())  # no exception
+        broken.hub.random_images = mock.AsyncMock(return_value=7)
+        await broken.async_next_image()  # a non-iterable answer is caught too
+        self.assertIsNone(broken._current_image_bytes)
+
+    async def test_an_album_entity_filters_on_its_album(self):
+        hub = FakeHub(info={})
+        await image.ImmichImageAlbum(object(), hub, timedelta(minutes=5), "album-1", "Holidays")._async_refresh(None)
+        self.assertEqual([({"albumIds": ["album-1"]}, image._MAX_ATTEMPTS)], hub.random_calls)
 
 
 if __name__ == "__main__":
