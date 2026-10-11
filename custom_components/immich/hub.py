@@ -34,10 +34,10 @@ class ImmichHub:
         self.api_key = api_key
 
     async def _call(
-        self, method: str, path: str, body: dict | None = None
+        self, method: str, path: str, body: dict | None = None, accept: str = "application/json"
     ) -> tuple[int, bytes, str]:
         """One request: status, body and content type. A connection problem or a timeout is CannotConnect."""
-        headers = {"Accept": "application/json", _HEADER_API_KEY: self.api_key}
+        headers = {"Accept": accept, _HEADER_API_KEY: self.api_key}
         try:
             async with self._session.request(
                 method, f"{self.host}{path}", headers=headers, json=body, timeout=_TIMEOUT
@@ -61,15 +61,20 @@ class ImmichHub:
             raise ApiError() from exception
 
     async def authenticate(self) -> bool:
-        """Test if we can authenticate with the host."""
+        """Test if we can authenticate with the host: False only when Immich says the key is wrong. A server
+        error or an answer that is not Immich's (a reverse proxy still starting) is CannotConnect, so it is
+        retried and does not start reauthentication."""
         status, data, _content_type = await self._call("POST", "/api/auth/validateToken")
+        if status in (401, 403):
+            return False
         if status != 200:
             _LOGGER.error("Error from API: status=%d body=%s", status, data[:_LOGGED_BODY])
-            return False
+            raise CannotConnect(f"Immich answered {status}")
         try:
             authenticated = bool(json.loads(data).get("authStatus"))
-        except (ValueError, AttributeError):
-            authenticated = False
+        except (ValueError, AttributeError) as exception:
+            _LOGGER.error("Error from API: not JSON: %s", data[:_LOGGED_BODY])
+            raise CannotConnect("Immich did not answer with JSON") from exception
         if not authenticated:
             _LOGGER.error("Error from API: body=%s", data[:_LOGGED_BODY])
         return authenticated
@@ -84,7 +89,9 @@ class ImmichHub:
 
     async def download_asset(self, asset_id: str) -> bytes | None:
         """Download the asset; None when Immich refuses it or it is not a picture Home Assistant can show."""
-        status, data, content_type = await self._call("GET", f"/api/assets/{asset_id}/original")
+        status, data, content_type = await self._call(
+            "GET", f"/api/assets/{asset_id}/original", accept="*/*"
+        )
         if status != 200:
             _LOGGER.error("Error from API: status=%d", status)
             return None
@@ -113,7 +120,7 @@ class ImmichHub:
         images: list[dict] = []
         page: int | None = 1
         while page:
-            body = dict(criteria, type="IMAGE", size=_PAGE_SIZE, page=page)
+            body = dict(criteria, size=_PAGE_SIZE, page=page)
             result = await self._json("POST", "/api/search/metadata", body)
             assets_page = result.get("assets", {})
             images.extend(

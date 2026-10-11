@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ha_stubs  # noqa: E402  must come before the component
 
 from custom_components.immich import (  # noqa: E402
+    ImmichData,
     async_setup_entry,
     hub as hub_module,
     image,
@@ -36,6 +37,7 @@ class FakeImmich:
         self.pages = [[{"id": "a", "type": "IMAGE"}, {"id": "v", "type": "VIDEO"}], [{"id": "b", "type": "IMAGE"}]]
         self.original = (200, b"jpeg-bytes", "image/jpeg")
         self.delay = 0
+        self.validate_status = 200
 
     def app(self):
         app = web.Application()
@@ -49,6 +51,8 @@ class FakeImmich:
     async def validate(self, request):
         self.requests.append(("validate", request.headers.get("x-api-key")))
         await asyncio.sleep(self.delay)
+        if self.validate_status != 200:
+            return web.Response(status=self.validate_status, text="<html>proxy</html>", content_type="text/html")
         return web.json_response({"authStatus": self.auth_status})
 
     async def search(self, request):
@@ -89,13 +93,35 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         self.fake.auth_status = False
         self.assertFalse(await self.hub.authenticate())
 
+    async def test_a_wrong_key_is_false_but_a_server_error_is_cannot_connect(self):
+        self.fake.validate_status = 401
+        self.assertFalse(await self.hub.authenticate())
+        self.fake.validate_status = 403
+        self.assertFalse(await self.hub.authenticate())
+        for status in (500, 502, 503):  # a reverse proxy that is still starting must be retried, not reauthenticated
+            self.fake.validate_status = status
+            with self.assertRaises(CannotConnect):
+                await self.hub.authenticate()
+
+    async def test_a_200_that_is_not_json_is_cannot_connect(self):
+        async def html(request):
+            return web.Response(text="<html>welcome</html>", content_type="text/html")
+        await ha_stubs.SESSION.close()
+        await self.server.close()
+        app = web.Application()
+        app.router.add_post("/api/auth/validateToken", html)
+        self.server = TestServer(app)
+        await self.server.start_server()
+        ha_stubs.SESSION = aiohttp.ClientSession()
+        with self.assertRaises(CannotConnect):
+            await ImmichHub(object(), str(self.server.make_url("")), KEY).authenticate()
+
     async def test_favorites_search_sends_json_booleans_and_follows_pages_and_drops_videos(self):
         images = await self.hub.list_favorite_images()
         self.assertEqual(["a", "b"], [i["id"] for i in images])
         bodies = [r[1] for r in self.fake.requests if r[0] == "search"]
         self.assertEqual([1, 2], [b["page"] for b in bodies])
         self.assertIs(True, bodies[0]["isFavorite"])  # a real boolean: Immich v3 refuses the string "true"
-        self.assertEqual("IMAGE", bodies[0]["type"])
 
     async def test_album_search_sends_the_album_id_as_a_list(self):
         await self.hub.list_album_images("album-1")
@@ -147,23 +173,36 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ha_stubs.ConfigEntryNotReady):
                 await async_setup_entry(self.hass(), self.entry())
 
+    async def test_an_album_list_that_fails_is_retried_by_setup_not_by_the_platform(self):
+        # Home Assistant retries a ConfigEntryNotReady from async_setup_entry; from a forwarded platform it does not.
+        for error in (CannotConnect("down"), ApiError()):
+            with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True),                     mock.patch("custom_components.immich.ImmichHub.list_all_albums", side_effect=error):
+                with self.assertRaises(ha_stubs.ConfigEntryNotReady):
+                    await async_setup_entry(self.hass(), self.entry())
+
     async def test_a_refused_key_starts_reauthentication(self):
         with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=False):
             with self.assertRaises(ha_stubs.ConfigEntryAuthFailed):
                 await async_setup_entry(self.hass(), self.entry())
 
-    async def test_a_good_key_stores_the_hub_and_sets_up_the_platform(self):
+    async def test_a_good_key_stores_the_hub_and_albums_and_sets_up_the_platform(self):
         hass, entry = self.hass(), self.entry()
-        with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True):
+        albums = [{"id": "x", "albumName": "Holidays"}]
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True),                 mock.patch("custom_components.immich.ImmichHub.list_all_albums", return_value=albums):
             self.assertTrue(await async_setup_entry(hass, entry))
-        self.assertIsInstance(entry.runtime_data, ImmichHub)
+        self.assertIsInstance(entry.runtime_data, ImmichData)
+        self.assertIsInstance(entry.runtime_data.hub, ImmichHub)
+        self.assertEqual(albums, entry.runtime_data.albums)
+        self.assertEqual(1, len(entry.listeners))  # options changes reload the entry
         hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
-    async def test_the_image_platform_retries_when_the_album_list_fails(self):
-        entry = self.entry()
-        entry.runtime_data = mock.Mock(list_all_albums=mock.AsyncMock(side_effect=CannotConnect("down")))
-        with self.assertRaises(ha_stubs.ConfigEntryNotReady):
-            await image.async_setup_entry(object(), entry, mock.Mock())
+    async def test_the_image_platform_creates_the_favorite_and_the_watched_albums(self):
+        albums = [{"id": "x", "albumName": "Holidays"}, {"id": "y", "albumName": "Work"}]
+        entry = CONFIG_ENTRY(options={"watched_albums": ["y"]})
+        entry.runtime_data = ImmichData(FakeHub(), albums)
+        added = []
+        await image.async_setup_entry(object(), entry, added.extend)
+        self.assertEqual(["Immich: Random favorite image", "Immich: Work"], [e._attr_name for e in added])
 
 
 class FakeHub:

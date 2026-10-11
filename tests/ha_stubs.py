@@ -40,6 +40,14 @@ class ConfigEntry(Generic[T]):
         self.options = options or {}
         self.entry_id = "entry"
         self.runtime_data = None
+        self.listeners = []
+
+    def add_update_listener(self, listener):
+        self.listeners.append(listener)
+        return lambda: self.listeners.remove(listener)
+
+    def async_on_unload(self, callback):
+        return callback
 
 
 class ImageEntity:

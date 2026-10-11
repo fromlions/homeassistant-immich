@@ -7,13 +7,13 @@ import random
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from . import ImmichConfigEntry
 from .const import CONF_WATCHED_ALBUMS
-from .hub import CannotConnect, ImmichHub
+from .hub import ImmichHub
 
 SCAN_INTERVAL = timedelta(minutes=5)
 
@@ -32,13 +32,8 @@ async def async_setup_entry(
 ) -> None:
     """Set up Immich image platform."""
 
-    hub = config_entry.runtime_data
-
-    try:
-        albums = await hub.list_all_albums()
-    except (CannotConnect, HomeAssistantError) as error:
-        # Retried by Home Assistant with a growing delay.
-        raise ConfigEntryNotReady(f"Cannot list the Immich albums: {error}") from error
+    hub = config_entry.runtime_data.hub
+    albums = config_entry.runtime_data.albums
 
     # Create entity for random favorite image
     async_add_entities([ImmichImageFavorite(hass, hub)])
@@ -54,13 +49,6 @@ async def async_setup_entry(
             if album["id"] in watched_albums
         ]
     )
-
-    config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
-
-
-async def update_listener(hass: HomeAssistant, config_entry: ImmichConfigEntry) -> None:
-    """Handle options updates."""
-    await hass.config_entries.async_reload(config_entry.entry_id)
 
 
 class BaseImmichImage(ImageEntity):
