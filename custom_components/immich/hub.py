@@ -112,29 +112,7 @@ class ImmichHub:
 
     async def list_favorite_images(self) -> list[dict]:
         """List all favorite images."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = urljoin(self.host, "/api/search/metadata")
-                headers = {"Accept": "application/json", _HEADER_API_KEY: self.api_key}
-                data = {"isFavorite": "true"}
-
-                async with session.post(url=url, headers=headers, data=data) as response:
-                    if response.status != 200:
-                        raw_result = await response.text()
-                        _LOGGER.error("Error from API: body=%s", raw_result)
-                        raise ApiError()
-
-                    favorites = await response.json()
-                    assets: list[dict] = favorites["assets"]["items"]
-
-                    filtered_assets: list[dict] = [
-                        asset for asset in assets if asset["type"] == "IMAGE"
-                    ]
-
-                    return filtered_assets
-        except aiohttp.ClientError as exception:
-            _LOGGER.error("Error connecting to the API: %s", exception)
-            raise CannotConnect from exception
+        return await self._search_images({"isFavorite": True})
 
     async def list_all_albums(self) -> list[dict]:
         """List all albums."""
@@ -158,9 +136,14 @@ class ImmichHub:
 
     async def list_album_images(self, album_id: str) -> list[dict]:
         """List all images in an album."""
+        # Immich v3 removed the embedded asset list from /api/albums/{id}, leaving only
+        # metadata and assetCount. Album contents come from the search endpoint instead.
+        return await self._search_images({"albumIds": [album_id]})
+
+    async def _search_images(self, criteria: dict) -> list[dict]:
+        """Every image matching the search criteria, page by page. The body goes as JSON: Immich v3
+        validates the types, so a boolean sent as the string "true" is refused."""
         try:
-            # Immich v3 removed the embedded asset list from /api/albums/{id}, leaving only
-            # metadata and assetCount. Album contents come from the search endpoint instead.
             async with aiohttp.ClientSession() as session:
                 url = urljoin(self.host, "/api/search/metadata")
                 headers = {
@@ -173,7 +156,7 @@ class ImmichHub:
                 page: int | None = 1
 
                 while page:
-                    body = {"albumIds": [album_id], "size": 1000, "page": page}
+                    body = dict(criteria, size=1000, page=page)
 
                     async with session.post(
                         url=url, headers=headers, json=body
