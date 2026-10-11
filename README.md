@@ -1,3 +1,12 @@
+> **Fork of [outadoc/immich-home-assistant](https://github.com/outadoc/immich-home-assistant)**, the original
+> integration by [@outadoc](https://github.com/outadoc). Upstream has not been updated since June 2024; this fork keeps
+> it working with current Home Assistant and Immich v3 (the options flow fix, album and favorites listing through
+> Immich's search endpoint, retries and timeouts). All credit for the integration goes to its author; upstream
+> publishes no licence, and this fork exists as a GitHub fork of that public repository.
+>
+> **Install:** HACS → ⋮ → Custom repositories → `https://github.com/fromlions/homeassistant-immich`, category
+> Integration. Remove the original Immich entry from HACS first if it is installed.
+
 # Immich × Home Assistant ![GitHub Release](https://img.shields.io/github/v/release/outadoc/immich-home-assistant) ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/outadoc/immich-home-assistant/validate.yml)
 
 This custom integration for Home Assistant allows you to display random pictures from your Immich instance right inside your dashboards.

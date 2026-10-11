@@ -1,0 +1,8 @@
+# Dev tooling only: nothing here is installed on the Home Assistant VM.
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+# Real errors only: syntax, undefined and unused names, imports. Style stays as written.
+select = ["E4", "E7", "E9", "F", "W6"]
