@@ -14,12 +14,23 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 _HEADER_API_KEY = "x-api-key"
 _LOGGER = logging.getLogger(__name__)
 
-_ALLOWED_MIME_TYPES = ["image/png", "image/jpeg"]
+# Immich serves previews as JPEG, or WebP when its image settings say so.
+_ALLOWED_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"]
+# A dashboard frame needs about 1440 px; the original can be tens of megabytes (and HEIC or RAW).
+_PICTURE_SIZE = "preview"
 # Seconds one request may take in total; Immich answers in well under this unless it is stuck.
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 _PAGE_SIZE = 1000
 # Bytes of an error body worth logging.
 _LOGGED_BODY = 500
+
+
+def normalize_host(host: str) -> str:
+    """The address as the integration stores it: a scheme (http when none is given), no trailing slash."""
+    host = host.strip()
+    if "://" not in host:
+        host = f"http://{host}"
+    return host.rstrip("/")
 
 
 class ImmichHub:
@@ -30,7 +41,7 @@ class ImmichHub:
         # Home Assistant's shared session: it is closed by Home Assistant, and reuses connections.
         self._session = async_get_clientsession(hass)
         # No trailing slash: a path prefix of a reverse proxy (https://host/immich) is kept.
-        self.host = host.rstrip("/")
+        self.host = normalize_host(host)
         self.api_key = api_key
 
     async def _call(
@@ -87,10 +98,11 @@ class ImmichHub:
         """Get asset info."""
         return await self._json("GET", f"/api/assets/{asset_id}")
 
-    async def download_asset(self, asset_id: str) -> bytes | None:
-        """Download the asset; None when Immich refuses it or it is not a picture Home Assistant can show."""
+    async def download_asset(self, asset_id: str) -> tuple[bytes, str] | None:
+        """The asset's preview picture and its content type; None when Immich refuses it or it is not a picture
+        Home Assistant can show."""
         status, data, content_type = await self._call(
-            "GET", f"/api/assets/{asset_id}/original", accept="*/*"
+            "GET", f"/api/assets/{asset_id}/thumbnail?size={_PICTURE_SIZE}", accept="*/*"
         )
         if status != 200:
             _LOGGER.error("Error from API: status=%d", status)
@@ -98,7 +110,7 @@ class ImmichHub:
         if content_type not in _ALLOWED_MIME_TYPES:
             _LOGGER.error("MIME type is not supported: %s", content_type)
             return None
-        return data
+        return data, content_type
 
     async def list_favorite_images(self) -> list[dict]:
         """List all favorite images."""

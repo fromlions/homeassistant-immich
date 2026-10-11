@@ -118,15 +118,17 @@ class BaseImmichImage(ImageEntity):
                 if not asset_id:
                     return
 
-                asset_bytes = await self.hub.download_asset(asset_id)
+                downloaded = await self.hub.download_asset(asset_id)
 
-                if not asset_bytes:
-                    # Not a picture Home Assistant can show (HEIC, WebP...): try another one.
+                if not downloaded:
+                    # Not a picture Home Assistant can show: try another one.
                     continue
 
+                asset_bytes, content_type = downloaded
                 await self._set_asset_attributes(asset_id)
 
                 self._current_image_bytes = asset_bytes
+                self._attr_content_type = content_type
                 self._attr_image_last_updated = dt_util.utcnow()
                 self.async_write_ha_state()
                 return
