@@ -18,6 +18,8 @@ import ha_stubs  # noqa: E402  must come before the component
 
 from custom_components.immich import (  # noqa: E402
     ImmichData,
+    CONFIG_SCHEMA,
+    async_setup,
     async_setup_entry,
     hub as hub_module,
     image,
@@ -259,15 +261,24 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(entry.listeners))  # options changes reload the entry
         hass.config_entries.async_forward_entry_setups.assert_awaited_once()
 
-    async def test_the_platform_hands_the_chosen_interval_to_every_entity_and_registers_the_service_once_per_setup(self):
+    async def test_the_service_is_registered_by_async_setup_not_by_the_entry(self):
+        ha_stubs.SERVICES.clear()
+        self.assertTrue(await async_setup(self.hass(), {}))
+        self.assertEqual([("immich", "next_image", "image", None, "async_next_image")], ha_stubs.SERVICES)
+        self.assertEqual(("schema", "immich"), CONFIG_SCHEMA)
+        # Setting an entry up, or failing to, registers nothing more or less.
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", side_effect=CannotConnect("down")):
+            with self.assertRaises(ha_stubs.ConfigEntryNotReady):
+                await async_setup_entry(self.hass(), self.entry())
+        self.assertEqual(1, len(ha_stubs.SERVICES))
+
+    async def test_the_platform_hands_the_chosen_interval_to_every_entity(self):
         albums = [{"id": "x", "albumName": "Holidays"}]
         entry = CONFIG_ENTRY(options={"watched_albums": ["x"], "refresh_interval": 15})
         entry.runtime_data = ImmichData(FakeHub(), albums)
         added = []
-        ha_stubs.PLATFORM.services.clear()
         await image.async_setup_entry(object(), entry, added.extend)
         self.assertEqual([timedelta(minutes=15)] * 2, [e._interval for e in added])
-        self.assertEqual([("next_image", None, "async_next_image")], ha_stubs.PLATFORM.services)
         self.assertTrue(callable(image.BaseImmichImage.async_next_image))
 
     async def test_names_and_unique_ids_stay_what_dashboards_are_bound_to(self):

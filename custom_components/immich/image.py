@@ -8,13 +8,12 @@ import logging
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from . import ImmichConfigEntry
-from .const import CONF_WATCHED_ALBUMS, SERVICE_NEXT_IMAGE
+from .const import CONF_WATCHED_ALBUMS
 from .hub import ImmichHub
 from .options import refresh_interval
 
@@ -34,12 +33,6 @@ async def async_setup_entry(
     hub = config_entry.runtime_data.hub
     albums = config_entry.runtime_data.albums
     interval = refresh_interval(config_entry.options)
-
-    # An entity service: it runs on the image entities the call targets. Home Assistant registers it once for
-    # the domain, whatever the number of entries, and ignores the repeat on a reload.
-    entity_platform.async_get_current_platform().async_register_entity_service(
-        SERVICE_NEXT_IMAGE, None, "async_next_image"
-    )
 
     # Create entity for random favorite image
     async_add_entities([ImmichImageFavorite(hass, hub, interval)])

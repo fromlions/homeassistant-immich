@@ -7,10 +7,17 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY, CONF_HOST, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_platform_entity_service
+from homeassistant.helpers.typing import ConfigType
 
+from .const import DOMAIN, SERVICE_NEXT_IMAGE
 from .hub import ApiError, CannotConnect, ImmichHub
 
 PLATFORMS: list[Platform] = [Platform.IMAGE]
+
+# Set up from the UI only; the schema is what Home Assistant wants next to an async_setup.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 @dataclass
@@ -22,6 +29,20 @@ class ImmichData:
 
 
 type ImmichConfigEntry = ConfigEntry[ImmichData]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the service. It lives here and not in the platform, so it exists even when the entry fails to
+    set up at boot, and an automation that calls it finds the action instead of "action not found"."""
+    async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_NEXT_IMAGE,
+        entity_domain=Platform.IMAGE,
+        schema=None,
+        func="async_next_image",
+    )
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ImmichConfigEntry) -> bool:
