@@ -51,5 +51,11 @@
         "fullsize": "Full size"
       }
     }
+  },
+  "services": {
+    "next_image": {
+      "name": "Next image",
+      "description": "Loads the next random picture now, without waiting for the refresh interval."
+    }
   }
 }

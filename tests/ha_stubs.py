@@ -67,6 +67,17 @@ class ImageEntity:
         pass
 
 
+class Platform:
+    """EntityPlatform.async_register_entity_service(name, schema, func) records its calls."""
+
+    def __init__(self):
+        self.services = []
+
+    def async_register_entity_service(self, name, schema, func, *args, **kwargs):
+        self.services.append((name, schema, func))
+
+
+PLATFORM = Platform()  # what async_get_current_platform returns
 TIMERS = []  # (hass, action, interval, cancelled) of every async_track_time_interval call
 
 
@@ -85,7 +96,8 @@ def install():
     module("homeassistant.const", CONF_API_KEY="api_key", CONF_HOST="host", Platform=types.SimpleNamespace(IMAGE="image"))
     module("homeassistant.helpers")
     module("homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda hass: SESSION)
-    module("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
+    module("homeassistant.helpers.entity_platform", AddEntitiesCallback=object,
+           async_get_current_platform=lambda: PLATFORM)
     module("homeassistant.helpers.event", async_track_time_interval=async_track_time_interval)
     module("homeassistant.components")
     module("homeassistant.components.image", ImageEntity=ImageEntity)
