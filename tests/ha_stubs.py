@@ -50,8 +50,26 @@ class ConfigEntry(Generic[T]):
         return callback
 
 
+TASKS = []  # (target, name, eager_start) of every config entry background task
+
+
+class StubConfigEntry:
+    def async_create_background_task(self, hass, target, name, eager_start=True):
+        TASKS.append((target, name, eager_start))
+
+
+class StubEntityPlatform:
+    config_entry = StubConfigEntry()
+
+
 class ImageEntity:
     _attr_image_last_updated = None
+    _attr_unique_id = None
+    platform = StubEntityPlatform()
+
+    @property
+    def unique_id(self):
+        return self._attr_unique_id
 
     def __init__(self, hass, verify_ssl=False):
         self.hass = hass
@@ -79,6 +97,11 @@ class Platform:
 
 PLATFORM = Platform()  # what async_get_current_platform returns
 TIMERS = []  # (hass, action, interval, cancelled) of every async_track_time_interval call
+
+
+async def fire(timer):
+    """One tick of a timer: the real tracker calls the action with the current time."""
+    await timer["action"](datetime.now(timezone.utc))
 
 
 def async_track_time_interval(hass, action, interval, *, name=None, cancel_on_shutdown=None):

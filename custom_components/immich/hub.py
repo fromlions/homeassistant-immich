@@ -97,7 +97,11 @@ class ImmichHub:
 
     async def get_asset_info(self, asset_id: str) -> dict | None:
         """Get asset info."""
-        return await self._json("GET", f"/api/assets/{asset_id}")
+        info = await self._json("GET", f"/api/assets/{asset_id}")
+        if not isinstance(info, dict):
+            _LOGGER.error("Error from API: asset info is not an object")
+            raise ApiError()
+        return info
 
     async def download_asset(self, asset_id: str) -> tuple[bytes, str] | None:
         """The asset's preview picture and its content type; None when Immich refuses it or it is not a picture
@@ -126,7 +130,12 @@ class ImmichHub:
         if not isinstance(result, list):
             _LOGGER.error("Error from API: random search did not answer with a list")
             raise ApiError()
-        return [asset for asset in result if asset.get("type") == "IMAGE"]
+        # An item that is not an image with an id is skipped rather than failing the whole refresh.
+        return [
+            asset
+            for asset in result
+            if isinstance(asset, dict) and asset.get("type") == "IMAGE" and isinstance(asset.get("id"), str)
+        ]
 
 
 class CannotConnect(HomeAssistantError):

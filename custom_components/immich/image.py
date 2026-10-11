@@ -1,6 +1,7 @@
 """Image device for Immich integration."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import logging
 
@@ -72,27 +73,45 @@ class BaseImmichImage(ImageEntity):
         super().__init__(hass=hass, verify_ssl=True)
         self.hub = hub
         self._interval = interval
+        # One refresh at a time: the timer, the service and image requests all end in the same cached bytes.
+        self._refresh_lock = asyncio.Lock()
         self.hass = hass
 
         self._attr_extra_state_attributes = {}
 
     async def async_added_to_hass(self) -> None:
-        """Start the refresh timer; it stops with the entity, which a changed option reloads."""
+        """Start the refresh timer, which stops with the entity (a changed option reloads it), and load the first
+        picture, so the entity has one after a restart or reload without waiting for the interval."""
         await super().async_added_to_hass()
         self.async_on_remove(async_track_time_interval(self.hass, self._async_refresh, self._interval))
+        # Tied to the entry, so unloading cancels it. Not eager: the entity must be fully added before it writes state.
+        self.platform.config_entry.async_create_background_task(
+            self.hass, self._refresh(wait=False), name=f"immich first picture {self.unique_id}", eager_start=False
+        )
 
     async def async_next_image(self) -> None:
-        """The next_image service: load the next picture now instead of waiting for the timer."""
-        await self._load_and_cache_next_image()
+        """The next_image service: load the next picture now instead of waiting for the timer. When a refresh
+        is already running, wait for it and return: it is the next picture too."""
+        await self._refresh(wait=True)
 
     async def _async_refresh(self, _now: datetime) -> None:
-        """The timer's action."""
-        await self._load_and_cache_next_image()
+        """The timer's action: a tick that finds a refresh still running is skipped, not queued."""
+        await self._refresh(wait=False)
+
+    async def _refresh(self, wait: bool) -> None:
+        """Run one refresh; if one is running already, optionally wait until it is done, and do not start another."""
+        if self._refresh_lock.locked():
+            if wait:
+                async with self._refresh_lock:
+                    pass
+            return
+        async with self._refresh_lock:
+            await self._load_and_cache_next_image()
 
     async def async_image(self) -> bytes | None:
         """Return the current image. If no image is available, load and cache the image."""
         if not self._current_image_bytes:
-            await self._load_and_cache_next_image()
+            await self._refresh(wait=True)
 
         return self._current_image_bytes
 
@@ -103,7 +122,9 @@ class BaseImmichImage(ImageEntity):
     async def _random_asset_ids(self) -> list[str]:
         """A few random asset ids from Immich: one request per refresh, the picture list is never fetched."""
         images = await self.hub.random_images(self._search_criteria(), _MAX_ATTEMPTS)
-        return [image["id"] for image in images]
+        ids = [image["id"] for image in images if isinstance(image, dict) and image.get("id")]
+        # Immich returns at most what was asked for; the cap is kept here too, so it holds whatever the answer.
+        return ids[:_MAX_ATTEMPTS]
 
     async def _load_and_cache_next_image(self) -> None:
         """Download and cache the next image; on any failure the previous image stays."""
@@ -130,15 +151,18 @@ class BaseImmichImage(ImageEntity):
                 return
 
             _LOGGER.warning("No usable picture among %d random ones; keeping the current one", len(asset_ids))
-        except HomeAssistantError as error:
-            # Immich unreachable or refusing: keep showing the last picture instead of failing the update.
-            _LOGGER.warning("Could not refresh the Immich picture: %s", error)
+        except (HomeAssistantError, KeyError, TypeError, ValueError, AttributeError) as error:
+            # Immich unreachable, refusing or answering something unexpected: keep showing the last picture
+            # instead of failing the update, the service or the image request.
+            _LOGGER.warning("Could not refresh the Immich picture: %r", error)
 
     async def _set_asset_attributes(self, asset_id: str) -> None:
         """The picture's file name, date and metadata as attributes; the picture shows without them."""
         try:
             asset_info = await self.hub.get_asset_info(asset_id) or {}
-        except HomeAssistantError as error:
+            if not isinstance(asset_info, dict):
+                raise TypeError("asset info is not an object")
+        except (HomeAssistantError, TypeError) as error:
             _LOGGER.debug("No metadata for %s: %s", asset_id, error)
             asset_info = {}
 

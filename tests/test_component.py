@@ -131,6 +131,10 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["album-1"], self.fake.requests[0][1]["albumIds"])
         self.assertEqual(["a"], [i["id"] for i in images])
 
+    async def test_random_search_skips_items_that_are_not_images_with_an_id(self):
+        self.fake.random_assets = [{"type": "IMAGE"}, "junk", None, {"id": 5, "type": "IMAGE"}, {"id": "ok", "type": "IMAGE"}]
+        self.assertEqual(["ok"], [i["id"] for i in await self.hub.random_images({}, 3)])
+
     async def test_random_search_with_no_match_is_an_empty_list_and_a_non_list_is_an_api_error(self):
         self.fake.random_assets = []
         self.assertEqual([], await self.hub.random_images({}, 3))
@@ -292,7 +296,7 @@ class FakeHub:
         self.random_calls.append((criteria, count))
         if self.error:
             raise self.error
-        return [{"id": i} for i in self.ids][:count]
+        return [{"id": i} for i in self.ids]  # no slicing: the entity itself must cap the attempts
 
     async def download_asset(self, asset_id):
         if self.error:
@@ -324,14 +328,14 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", entity._attr_extra_state_attributes["media_filename"])
 
     async def test_unusable_pictures_stop_after_the_attempt_cap_and_keep_the_previous_one(self):
-        hub = FakeHub(ids=("a", "b", "c"), downloads=((b"first", "image/jpeg"), None, None, None), info={})
+        hub = FakeHub(ids=tuple("abcdefgh"), downloads=((b"first", "image/jpeg"), None), info={})
         entity = self.entity(hub)
         await entity._async_refresh(None)
         self.assertEqual(b"first", entity._current_image_bytes)
         hub.download_calls = 1
         await entity._async_refresh(None)
         self.assertEqual(b"first", entity._current_image_bytes)
-        self.assertEqual(1 + image._MAX_ATTEMPTS, hub.download_calls)
+        self.assertEqual(1 + image._MAX_ATTEMPTS, hub.download_calls)  # eight ids on offer, three tried
 
     async def test_an_unreachable_immich_keeps_the_previous_picture(self):
         hub = FakeHub(info={})
@@ -362,6 +366,7 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         entity = image.ImmichImageFavorite(object(), hub, timedelta(minutes=7))
         ha_stubs.TIMERS.clear()
         await entity.async_added_to_hass()
+        ha_stubs.TASKS.pop()[0].close()
         (timer,) = ha_stubs.TIMERS
         self.assertEqual(timedelta(minutes=7), timer["interval"])
         self.assertFalse(entity._attr_should_poll)  # Home Assistant's own polling would add a second schedule
@@ -381,6 +386,70 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         hub.error = CannotConnect("down")
         await entity.async_next_image()  # no exception
         self.assertEqual(b"two", entity._current_image_bytes)
+
+    async def test_the_first_picture_loads_in_the_background_when_the_entity_is_added(self):
+        hub = FakeHub(info={})
+        entity = self.entity(hub)
+        ha_stubs.TASKS.clear()
+        await entity.async_added_to_hass()
+        ((target, name, eager_start),) = ha_stubs.TASKS
+        self.assertFalse(eager_start)  # the entity must be added before it writes state
+        self.assertIsNone(entity._current_image_bytes)
+        await target
+        self.assertEqual(b"img", entity._current_image_bytes)
+
+    async def test_a_tick_during_a_running_refresh_is_skipped_and_the_service_waits_for_it(self):
+        release = asyncio.Event()
+        hub = FakeHub(info={})
+        real = hub.random_images
+
+        async def blocked(criteria, count):
+            await release.wait()
+            return await real(criteria, count)
+
+        hub.random_images = blocked
+        entity = self.entity(hub)
+        ha_stubs.TIMERS.clear()
+        await entity.async_added_to_hass()
+        ha_stubs.TASKS.pop()[0].close()
+        (timer,) = ha_stubs.TIMERS
+        running = asyncio.create_task(ha_stubs.fire(timer))
+        await asyncio.sleep(0)
+        await ha_stubs.fire(timer)  # returns at once: skipped, not queued
+        self.assertFalse(running.done())
+        service = asyncio.create_task(entity.async_next_image())
+        image_request = asyncio.create_task(entity.async_image())
+        await asyncio.sleep(0)
+        self.assertFalse(service.done())
+        self.assertFalse(image_request.done())
+        release.set()
+        await asyncio.gather(running, service)
+        self.assertEqual(b"img", await image_request)
+        self.assertEqual(1, hub.download_calls)  # one refresh served all four callers
+
+    async def test_the_next_tick_after_a_finished_refresh_runs_again(self):
+        hub = FakeHub(info={})
+        entity = self.entity(hub)
+        ha_stubs.TIMERS.clear()
+        await entity.async_added_to_hass()
+        ha_stubs.TASKS.pop()[0].close()
+        (timer,) = ha_stubs.TIMERS
+        await ha_stubs.fire(timer)
+        await ha_stubs.fire(timer)
+        self.assertEqual(2, hub.download_calls)
+
+    async def test_malformed_search_results_are_skipped_and_do_not_escape(self):
+        entity = self.entity(FakeHub(info=[1, 2]))
+        entity.hub.random_images = mock.AsyncMock(return_value=[{"type": "IMAGE"}, "junk", None, {"id": "a"}])
+        await entity.async_next_image()
+        self.assertEqual(b"img", entity._current_image_bytes)
+        self.assertEqual("", entity._attr_extra_state_attributes["media_filename"])  # metadata that is no object
+        broken = self.entity(FakeHub())
+        broken.hub.random_images = mock.AsyncMock(return_value=[{"type": "IMAGE"}, 5])
+        self.assertIsNone(await broken.async_image())  # no exception
+        broken.hub.random_images = mock.AsyncMock(return_value=7)
+        await broken.async_next_image()  # a non-iterable answer is caught too
+        self.assertIsNone(broken._current_image_bytes)
 
     async def test_an_album_entity_filters_on_its_album(self):
         hub = FakeHub(info={})
