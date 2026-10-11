@@ -1,9 +1,8 @@
 """Image device for Immich integration."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 import logging
-import random
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant
@@ -17,9 +16,7 @@ from .hub import ImmichHub
 
 SCAN_INTERVAL = timedelta(minutes=5)
 
-# How often to refresh the list of available asset IDs
-_ID_LIST_REFRESH_INTERVAL = timedelta(hours=12)
-# Pictures tried for one refresh before it gives up and the entity keeps showing the previous one.
+# Random pictures asked for, and so tried, in one refresh before it gives up and the entity keeps the previous one.
 _MAX_ATTEMPTS = 3
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,8 +57,6 @@ class BaseImmichImage(ImageEntity):
     _attr_should_poll = True
 
     _current_image_bytes: bytes | None = None
-    _cached_available_asset_ids: list[str] | None = None
-    _available_asset_ids_last_updated: datetime | None = None
 
     def __init__(self, hass: HomeAssistant, hub: ImmichHub) -> None:
         """Initialize the Immich image entity."""
@@ -82,42 +77,24 @@ class BaseImmichImage(ImageEntity):
 
         return self._current_image_bytes
 
-    async def _refresh_available_asset_ids(self) -> list[str] | None:
-        """Refresh the list of available asset IDs."""
+    def _search_criteria(self) -> dict:
+        """What Immich's random search filters on."""
         raise NotImplementedError
 
-    async def _get_next_asset_id(self) -> str | None:
-        """Get the asset id of the next image we want to display."""
-        if (
-            not self._available_asset_ids_last_updated
-            or (dt_util.utcnow() - self._available_asset_ids_last_updated)
-            > _ID_LIST_REFRESH_INTERVAL
-        ):
-            # If we don't have any available asset IDs yet, or the list is stale, refresh it
-            _LOGGER.debug("Refreshing available asset IDs")
-            self._cached_available_asset_ids = await self._refresh_available_asset_ids()
-            # An empty list is not kept for hours: Immich may just have restarted, or the album is being filled.
-            if self._cached_available_asset_ids:
-                self._available_asset_ids_last_updated = dt_util.utcnow()
-
-        if not self._cached_available_asset_ids:
-            _LOGGER.debug("No assets are available")
-            return None
-
-        # Select random item in list
-        random_asset = random.choice(self._cached_available_asset_ids)
-
-        return random_asset
+    async def _random_asset_ids(self) -> list[str]:
+        """A few random asset ids from Immich: one request per refresh, the picture list is never fetched."""
+        images = await self.hub.random_images(self._search_criteria(), _MAX_ATTEMPTS)
+        return [image["id"] for image in images]
 
     async def _load_and_cache_next_image(self) -> None:
         """Download and cache the next image; on any failure the previous image stays."""
         try:
-            for _attempt in range(_MAX_ATTEMPTS):
-                asset_id = await self._get_next_asset_id()
+            asset_ids = await self._random_asset_ids()
+            if not asset_ids:
+                _LOGGER.debug("No assets are available")
+                return
 
-                if not asset_id:
-                    return
-
+            for asset_id in asset_ids:
                 downloaded = await self.hub.download_asset(asset_id)
 
                 if not downloaded:
@@ -133,7 +110,7 @@ class BaseImmichImage(ImageEntity):
                 self.async_write_ha_state()
                 return
 
-            _LOGGER.warning("No usable picture after %d tries; keeping the current one", _MAX_ATTEMPTS)
+            _LOGGER.warning("No usable picture among %d random ones; keeping the current one", len(asset_ids))
         except HomeAssistantError as error:
             # Immich unreachable or refusing: keep showing the last picture instead of failing the update.
             _LOGGER.warning("Could not refresh the Immich picture: %s", error)
@@ -163,9 +140,8 @@ class ImmichImageFavorite(BaseImmichImage):
     _attr_unique_id = "favorite_image"
     _attr_name = "Immich: Random favorite image"
 
-    async def _refresh_available_asset_ids(self) -> list[str] | None:
-        """Refresh the list of available asset IDs."""
-        return [image["id"] for image in await self.hub.list_favorite_images()]
+    def _search_criteria(self) -> dict:
+        return {"isFavorite": True}
 
 
 class ImmichImageAlbum(BaseImmichImage):
@@ -180,8 +156,5 @@ class ImmichImageAlbum(BaseImmichImage):
         self._attr_unique_id = album_id
         self._attr_name = f"Immich: {album_name}"
 
-    async def _refresh_available_asset_ids(self) -> list[str] | None:
-        """Refresh the list of available asset IDs."""
-        return [
-            image["id"] for image in await self.hub.list_album_images(self._album_id)
-        ]
+    def _search_criteria(self) -> dict:
+        return {"albumIds": [self._album_id]}

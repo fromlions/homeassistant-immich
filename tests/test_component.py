@@ -35,7 +35,7 @@ class FakeImmich:
         self.prefix = prefix
         self.requests = []
         self.auth_status = True
-        self.pages = [[{"id": "a", "type": "IMAGE"}, {"id": "v", "type": "VIDEO"}], [{"id": "b", "type": "IMAGE"}]]
+        self.random_assets = [{"id": "a", "type": "IMAGE"}, {"id": "b", "type": "IMAGE"}]
         self.original = (200, b"jpeg-bytes", "image/jpeg")
         self.delay = 0
         self.validate_status = 200
@@ -44,7 +44,7 @@ class FakeImmich:
         app = web.Application()
         p = self.prefix
         app.router.add_post(p + "/api/auth/validateToken", self.validate)
-        app.router.add_post(p + "/api/search/metadata", self.search)
+        app.router.add_post(p + "/api/search/random", self.search)
         app.router.add_get(p + "/api/assets/{id}/thumbnail", self.download)
         app.router.add_get(p + "/api/albums", self.albums)
         return app
@@ -59,10 +59,7 @@ class FakeImmich:
     async def search(self, request):
         body = await request.json()
         self.requests.append(("search", body))
-        number = body["page"]
-        items = self.pages[number - 1]
-        assets = {"items": items, "nextPage": str(number + 1) if number < len(self.pages) else None}
-        return web.json_response({"assets": assets})
+        return web.json_response(self.random_assets)
 
     async def download(self, request):
         self.requests.append(("thumbnail", request.query.get("size")))
@@ -118,16 +115,26 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CannotConnect):
             await ImmichHub(object(), str(self.server.make_url("")), KEY).authenticate()
 
-    async def test_favorites_search_sends_json_booleans_and_follows_pages_and_drops_videos(self):
-        images = await self.hub.list_favorite_images()
+    async def test_random_search_sends_typed_json_and_asks_for_few_images_without_exif(self):
+        images = await self.hub.random_images({"isFavorite": True}, 3)
         self.assertEqual(["a", "b"], [i["id"] for i in images])
-        bodies = [r[1] for r in self.fake.requests if r[0] == "search"]
-        self.assertEqual([1, 2], [b["page"] for b in bodies])
-        self.assertIs(True, bodies[0]["isFavorite"])  # a real boolean: Immich v3 refuses the string "true"
+        self.assertEqual(1, len(self.fake.requests))  # one request: the library is never listed
+        body = self.fake.requests[0][1]
+        self.assertIs(True, body["isFavorite"])  # a real boolean: Immich v3 refuses the string "true"
+        self.assertEqual({"size": 3, "type": "IMAGE", "withExif": False}, {k: body[k] for k in ("size", "type", "withExif")})
 
-    async def test_album_search_sends_the_album_id_as_a_list(self):
-        await self.hub.list_album_images("album-1")
+    async def test_random_search_sends_the_album_id_as_a_list_and_drops_other_types(self):
+        self.fake.random_assets = [{"id": "a", "type": "IMAGE"}, {"id": "v", "type": "VIDEO"}]
+        images = await self.hub.random_images({"albumIds": ["album-1"]}, 3)
         self.assertEqual(["album-1"], self.fake.requests[0][1]["albumIds"])
+        self.assertEqual(["a"], [i["id"] for i in images])
+
+    async def test_random_search_with_no_match_is_an_empty_list_and_a_non_list_is_an_api_error(self):
+        self.fake.random_assets = []
+        self.assertEqual([], await self.hub.random_images({}, 3))
+        self.fake.random_assets = {"assets": {}}
+        with self.assertRaises(ApiError):
+            await self.hub.random_images({}, 3)
 
     async def test_a_path_prefix_of_a_reverse_proxy_is_kept(self):
         await ha_stubs.SESSION.close()
@@ -228,13 +235,13 @@ class FakeHub:
     def __init__(self, ids=("a",), downloads=((b"img", "image/jpeg"),), info=None, error=None):
         self.ids, self.downloads, self.info, self.error = list(ids), list(downloads), info, error
         self.download_calls = 0
-        self.list_calls = 0
+        self.random_calls = []
 
-    async def list_favorite_images(self):
-        self.list_calls += 1
+    async def random_images(self, criteria, count):
+        self.random_calls.append((criteria, count))
         if self.error:
             raise self.error
-        return [{"id": i} for i in self.ids]
+        return [{"id": i} for i in self.ids][:count]
 
     async def download_asset(self, asset_id):
         if self.error:
@@ -266,7 +273,7 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", entity._attr_extra_state_attributes["media_filename"])
 
     async def test_unusable_pictures_stop_after_the_attempt_cap_and_keep_the_previous_one(self):
-        hub = FakeHub(downloads=((b"first", "image/jpeg"), None, None, None), info={})
+        hub = FakeHub(ids=("a", "b", "c"), downloads=((b"first", "image/jpeg"), None, None, None), info={})
         entity = self.entity(hub)
         await entity.async_update()
         self.assertEqual(b"first", entity._current_image_bytes)
@@ -280,24 +287,29 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         entity = self.entity(hub)
         await entity.async_update()
         hub.error = CannotConnect("down")
-        entity._available_asset_ids_last_updated = None
         await entity.async_update()  # no exception
         self.assertEqual(b"img", entity._current_image_bytes)
 
-    async def test_an_empty_list_is_asked_for_again_next_time(self):
+    async def test_nothing_matching_keeps_the_entity_empty_and_asks_again_next_time(self):
         hub = FakeHub(ids=())
         entity = self.entity(hub)
         await entity.async_update()
         await entity.async_update()
-        self.assertEqual(2, hub.list_calls)
+        self.assertEqual(2, len(hub.random_calls))
         self.assertIsNone(entity._current_image_bytes)
+        self.assertEqual(0, hub.download_calls)
 
-    async def test_a_filled_list_is_kept_for_the_refresh_interval(self):
-        hub = FakeHub(info={})
+    async def test_every_refresh_asks_immich_for_new_random_pictures(self):
+        hub = FakeHub(ids=("a", "b", "c", "d"), info={})
         entity = self.entity(hub)
         await entity.async_update()
         await entity.async_update()
-        self.assertEqual(1, hub.list_calls)
+        self.assertEqual([({"isFavorite": True}, image._MAX_ATTEMPTS)] * 2, hub.random_calls)
+
+    async def test_an_album_entity_filters_on_its_album(self):
+        hub = FakeHub(info={})
+        await image.ImmichImageAlbum(object(), hub, "album-1", "Holidays").async_update()
+        self.assertEqual([({"albumIds": ["album-1"]}, image._MAX_ATTEMPTS)], hub.random_calls)
 
 
 if __name__ == "__main__":
