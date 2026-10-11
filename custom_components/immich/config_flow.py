@@ -1,6 +1,7 @@
 """Config flow for Immich integration."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_API_KEY, CONF_HOST
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
 from .const import CONF_WATCHED_ALBUMS, DOMAIN
@@ -36,7 +38,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     url = url_normalize(data[CONF_HOST])
     api_key = data[CONF_API_KEY]
 
-    hub = ImmichHub(host=url, api_key=api_key)
+    hub = ImmichHub(hass, host=url, api_key=api_key)
 
     if not await hub.authenticate():
         raise InvalidAuth
@@ -79,6 +81,39 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
 
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+        """Immich refused the API key: ask for a new one."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Take the new API key for the same host."""
+        errors: dict[str, str] = {}
+        entry = self._get_reauth_entry()
+        if user_input is not None:
+            try:
+                await validate_input(
+                    self.hass, {CONF_HOST: entry.data[CONF_HOST], CONF_API_KEY: user_input[CONF_API_KEY]}
+                )
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry, data_updates={CONF_API_KEY: user_input[CONF_API_KEY]}
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_API_KEY): str}),
+            errors=errors,
+        )
+
     @staticmethod
     @callback
     def async_get_options_flow(
@@ -101,13 +136,15 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         # Get a connection to the hub in order to list the available albums
         url = url_normalize(self.config_entry.data[CONF_HOST])
         api_key = self.config_entry.data[CONF_API_KEY]
-        hub = ImmichHub(host=url, api_key=api_key)
+        hub = ImmichHub(self.hass, host=url, api_key=api_key)
 
-        if not await hub.authenticate():
-            raise InvalidAuth
-
-        # Get the list of albums and create a mapping of album id to album name
-        albums = await hub.list_all_albums()
+        try:
+            if not await hub.authenticate():
+                return self.async_abort(reason="invalid_auth")
+            # Get the list of albums and create a mapping of album id to album name
+            albums = await hub.list_all_albums()
+        except HomeAssistantError:
+            return self.async_abort(reason="cannot_connect")
         album_map = {album["id"]: album["albumName"] for album in albums}
 
         # Filter out any album ids that are no longer returned by the API
