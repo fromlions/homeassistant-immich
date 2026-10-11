@@ -21,6 +21,7 @@ from custom_components.immich import (  # noqa: E402
     async_setup_entry,
     hub as hub_module,
     image,
+    options,
 )
 from custom_components.immich.hub import ApiError, CannotConnect, ImmichHub, normalize_host  # noqa: E402
 
@@ -156,6 +157,11 @@ class HubTest(unittest.IsolatedAsyncioTestCase):
         self.fake.original = (200, b"heic", "image/heic")
         self.assertIsNone(await self.hub.download_asset(ASSET))
 
+    async def test_download_asks_for_the_configured_size(self):
+        full = ImmichHub(object(), self.host, KEY, image_size="fullsize")
+        await full.download_asset(ASSET)
+        self.assertEqual(("thumbnail", "fullsize"), self.fake.requests[-1])
+
     async def test_a_non_json_answer_is_an_api_error(self):
         with self.assertRaises(ApiError):
             await self.hub.list_all_albums()
@@ -184,6 +190,43 @@ class HostAndManifestTest(unittest.TestCase):
         self.assertIn("fromlions/homeassistant-immich", manifest["documentation"])
         self.assertEqual("local_polling", manifest["iot_class"])
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
+
+
+class OptionsTest(unittest.TestCase):
+    def test_nothing_set_gives_the_defaults(self):
+        self.assertEqual("preview", options.image_size({}))
+        self.assertEqual(5, options.refresh_minutes({}))
+        self.assertEqual(timedelta(minutes=5), options.refresh_interval({"watched_albums": []}))
+
+    def test_set_values_are_used(self):
+        given = {"image_size": "fullsize", "refresh_interval": 30}
+        self.assertEqual("fullsize", options.image_size(given))
+        self.assertEqual(timedelta(minutes=30), options.refresh_interval(given))
+        self.assertEqual(30, options.refresh_minutes({"refresh_interval": 30.0}))  # a number selector gives floats
+
+    def test_values_outside_the_allowed_range_or_kind_fall_back_or_clamp(self):
+        self.assertEqual("preview", options.image_size({"image_size": "original"}))  # not offered
+        self.assertEqual(1, options.refresh_minutes({"refresh_interval": 0}))
+        self.assertEqual(1440, options.refresh_minutes({"refresh_interval": 100000}))
+        self.assertEqual(5, options.refresh_minutes({"refresh_interval": "soon"}))
+        self.assertEqual(5, options.refresh_minutes({"refresh_interval": None}))
+
+
+class StringsTest(unittest.TestCase):
+    root = Path(__file__).resolve().parents[1] / "custom_components" / "immich"
+
+    def test_strings_and_english_translation_agree_on_options_selectors_and_services(self):
+        strings = json.loads((self.root / "strings.json").read_text(encoding="utf8"))
+        english = json.loads((self.root / "translations" / "en.json").read_text(encoding="utf8"))
+        for key in ("watched_albums", "image_size", "refresh_interval"):
+            self.assertIn(key, strings["options"]["step"]["init"]["data"])
+        self.assertEqual(strings["options"]["step"]["init"], english["options"]["step"]["init"])
+        self.assertEqual(strings["selector"], english["selector"])
+        self.assertEqual(strings["services"], english["services"])
+        self.assertEqual({"preview", "fullsize"}, set(strings["selector"]["image_size"]["options"]))
+
+    def test_the_service_is_described_in_services_yaml(self):
+        self.assertRegex((self.root / "services.yaml").read_text(encoding="utf8"), r"(?m)^next_image:")
 
 
 class SetupTest(unittest.IsolatedAsyncioTestCase):
@@ -222,6 +265,31 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(albums, entry.runtime_data.albums)
         self.assertEqual(1, len(entry.listeners))  # options changes reload the entry
         hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+
+    async def test_the_hub_gets_the_picture_size_from_the_options(self):
+        for given, expected in (({}, "preview"), ({"image_size": "fullsize"}, "fullsize")):
+            entry = CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY}, options=given)
+            with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True),                     mock.patch("custom_components.immich.ImmichHub.list_all_albums", return_value=[]):
+                await async_setup_entry(self.hass(), entry)
+            self.assertEqual(expected, entry.runtime_data.hub.image_size)
+
+    async def test_the_platform_hands_the_chosen_interval_to_every_entity_and_registers_the_service_once_per_setup(self):
+        albums = [{"id": "x", "albumName": "Holidays"}]
+        entry = CONFIG_ENTRY(options={"watched_albums": ["x"], "refresh_interval": 15})
+        entry.runtime_data = ImmichData(FakeHub(), albums)
+        added = []
+        ha_stubs.PLATFORM.services.clear()
+        await image.async_setup_entry(object(), entry, added.extend)
+        self.assertEqual([timedelta(minutes=15)] * 2, [e._interval for e in added])
+        self.assertEqual([("next_image", None, "async_next_image")], ha_stubs.PLATFORM.services)
+        self.assertTrue(callable(image.BaseImmichImage.async_next_image))
+
+    async def test_names_and_unique_ids_stay_what_dashboards_are_bound_to(self):
+        favorite = image.ImmichImageFavorite(object(), FakeHub(), timedelta(minutes=5))
+        album = image.ImmichImageAlbum(object(), FakeHub(), timedelta(minutes=5), "album-id", "Screen saver")
+        self.assertEqual(("favorite_image", "Immich: Random favorite image"), (favorite._attr_unique_id, favorite._attr_name))
+        self.assertEqual(("album-id", "Immich: Screen saver"), (album._attr_unique_id, album._attr_name))
+        self.assertFalse(hasattr(favorite, "_attr_device_info"))
 
     async def test_the_image_platform_creates_the_favorite_and_the_watched_albums(self):
         albums = [{"id": "x", "albumName": "Holidays"}, {"id": "y", "albumName": "Work"}]
@@ -306,6 +374,31 @@ class ImageEntityTest(unittest.IsolatedAsyncioTestCase):
         await entity._async_refresh(None)
         await entity._async_refresh(None)
         self.assertEqual([({"isFavorite": True}, image._MAX_ATTEMPTS)] * 2, hub.random_calls)
+
+    async def test_the_timer_runs_at_the_interval_loads_a_picture_and_stops_with_the_entity(self):
+        hub = FakeHub(info={})
+        entity = image.ImmichImageFavorite(object(), hub, timedelta(minutes=7))
+        ha_stubs.TIMERS.clear()
+        await entity.async_added_to_hass()
+        (timer,) = ha_stubs.TIMERS
+        self.assertEqual(timedelta(minutes=7), timer["interval"])
+        self.assertFalse(entity._attr_should_poll)  # Home Assistant's own polling would add a second schedule
+        await timer["action"](None)
+        self.assertEqual(b"img", entity._current_image_bytes)
+        for remove in entity.on_remove:
+            remove()
+        self.assertTrue(timer["cancelled"])
+
+    async def test_next_image_loads_a_new_picture_now_and_a_failure_keeps_the_old_one(self):
+        hub = FakeHub(downloads=((b"one", "image/jpeg"), (b"two", "image/jpeg")), info={})
+        entity = self.entity(hub)
+        await entity.async_next_image()
+        self.assertEqual(b"one", entity._current_image_bytes)
+        await entity.async_next_image()
+        self.assertEqual(b"two", entity._current_image_bytes)
+        hub.error = CannotConnect("down")
+        await entity.async_next_image()  # no exception
+        self.assertEqual(b"two", entity._current_image_bytes)
 
     async def test_an_album_entity_filters_on_its_album(self):
         hub = FakeHub(info={})
