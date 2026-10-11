@@ -62,6 +62,55 @@ class StubEntityPlatform:
     config_entry = StubConfigEntry()
 
 
+class ConfigFlow:
+    def __init_subclass__(cls, domain=None, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+
+class OptionsFlow:
+    """What the options flow uses: hass and config_entry are set by Home Assistant, the rest returns the result."""
+
+    hass = None
+    config_entry = None
+
+    def async_show_form(self, *, step_id=None, data_schema=None, errors=None, description_placeholders=None,
+                        last_step=None, preview=None):
+        return {"type": "form", "step_id": step_id, "data_schema": data_schema, "errors": errors}
+
+    def async_create_entry(self, *, title=None, data):
+        return {"type": "create_entry", "title": title, "data": data}
+
+    def async_abort(self, *, reason, description_placeholders=None):
+        return {"type": "abort", "reason": reason}
+
+
+class MultiSelect:
+    """config_validation.multi_select: a list of keys of the options."""
+
+    def __init__(self, options):
+        self.options = options
+
+    def __call__(self, selected):
+        import voluptuous
+        if not isinstance(selected, list) or any(item not in self.options for item in selected):
+            raise voluptuous.Invalid("not a selection")
+        return selected
+
+
+class NumberSelector:
+    """helpers.selector.NumberSelector: a float within min and max."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, data):
+        import voluptuous
+        value = float(data)
+        if value < self.config["min"] or value > self.config["max"]:
+            raise voluptuous.Invalid(f"{value} is out of range")
+        return value
+
+
 class ImageEntity:
     _attr_image_last_updated = None
     _attr_unique_id = None
@@ -115,12 +164,16 @@ def install():
     module("homeassistant.core", HomeAssistant=object, callback=lambda f: f)
     module("homeassistant.exceptions", HomeAssistantError=HomeAssistantError, ConfigEntryNotReady=ConfigEntryNotReady,
            ConfigEntryAuthFailed=ConfigEntryAuthFailed)
-    module("homeassistant.config_entries", ConfigEntry=ConfigEntry)
+    module("homeassistant.config_entries", ConfigEntry=ConfigEntry, ConfigFlow=ConfigFlow, OptionsFlow=OptionsFlow,
+           ConfigFlowResult=dict)
     module("homeassistant.const", CONF_API_KEY="api_key", CONF_HOST="host", Platform=types.SimpleNamespace(IMAGE="image"))
     module("homeassistant.helpers")
     module("homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda hass: SESSION)
     module("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
-    module("homeassistant.helpers.config_validation", config_entry_only_config_schema=lambda domain: ("schema", domain))
+    module("homeassistant.helpers.config_validation", config_entry_only_config_schema=lambda domain: ("schema", domain),
+           multi_select=MultiSelect)
+    module("homeassistant.helpers.selector", NumberSelector=NumberSelector, NumberSelectorConfig=dict,
+           NumberSelectorMode=types.SimpleNamespace(BOX="box"))
     module("homeassistant.helpers.service", async_register_platform_entity_service=async_register_platform_entity_service)
     module("homeassistant.helpers.typing", ConfigType=dict)
     module("homeassistant.helpers.event", async_track_time_interval=async_track_time_interval)

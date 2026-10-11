@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ha_stubs  # noqa: E402  must come before the component
 
 from custom_components.immich import (  # noqa: E402
+    config_flow,
     ImmichData,
     CONFIG_SCHEMA,
     async_setup,
@@ -207,6 +208,66 @@ class OptionsTest(unittest.TestCase):
         self.assertEqual(1440, options.refresh_minutes({"refresh_interval": 100000}))
         self.assertEqual(5, options.refresh_minutes({"refresh_interval": "soon"}))
         self.assertEqual(5, options.refresh_minutes({"refresh_interval": None}))
+
+
+class OptionsFlowTest(unittest.IsolatedAsyncioTestCase):
+    ALBUMS = [{"id": "x", "albumName": "Holidays"}, {"id": "y", "albumName": "Work"}]
+
+    async def form(self, options, albums=None):
+        flow = config_flow.OptionsFlowHandler()
+        flow.hass = object()
+        flow.config_entry = CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY}, options=options)
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=True),                 mock.patch("custom_components.immich.ImmichHub.list_all_albums", return_value=albums or self.ALBUMS):
+            return flow, await flow.async_step_init()
+
+    async def test_an_entry_with_only_watched_albums_gets_the_defaults(self):
+        _flow, result = await self.form({"watched_albums": ["y"]})
+        self.assertEqual("form", result["type"])
+        saved = result["data_schema"]({})
+        self.assertEqual({"watched_albums": ["y"], "refresh_interval": 5}, saved)
+        self.assertIsInstance(saved["refresh_interval"], int)
+
+    async def test_an_entry_without_options_gets_no_albums_and_five_minutes(self):
+        _flow, result = await self.form({})
+        self.assertEqual({"watched_albums": [], "refresh_interval": 5}, result["data_schema"]({}))
+
+    async def test_stored_values_are_the_defaults_and_albums_that_are_gone_are_dropped(self):
+        _flow, result = await self.form({"watched_albums": ["x", "gone"], "refresh_interval": 30})
+        self.assertEqual({"watched_albums": ["x"], "refresh_interval": 30}, result["data_schema"]({}))
+
+    async def test_a_stored_interval_outside_the_range_is_shown_clamped(self):
+        _flow, result = await self.form({"refresh_interval": 100000})
+        self.assertEqual(1440, result["data_schema"]({})["refresh_interval"])
+        _flow, result = await self.form({"refresh_interval": 0})
+        self.assertEqual(1, result["data_schema"]({})["refresh_interval"])
+
+    async def test_the_form_accepts_one_to_1440_minutes_as_whole_numbers_and_refuses_the_rest(self):
+        import voluptuous
+        _flow, result = await self.form({})
+        schema = result["data_schema"]
+        for accepted in (1, 5.0, 1440):
+            saved = schema({"watched_albums": [], "refresh_interval": accepted})
+            self.assertEqual(int(accepted), saved["refresh_interval"])
+            self.assertIsInstance(saved["refresh_interval"], int)
+        for refused in (0, 1441, -3, "soon"):
+            with self.assertRaises(voluptuous.Invalid):
+                schema({"watched_albums": [], "refresh_interval": refused})
+        with self.assertRaises(voluptuous.Invalid):
+            schema({"watched_albums": ["unknown"]})
+
+    async def test_submitting_stores_the_input_as_the_options(self):
+        flow, _result = await self.form({})
+        result = await flow.async_step_init({"watched_albums": ["x"], "refresh_interval": 20})
+        self.assertEqual({"watched_albums": ["x"], "refresh_interval": 20}, result["data"])
+
+    async def test_a_refused_key_or_unreachable_immich_aborts_the_form(self):
+        flow = config_flow.OptionsFlowHandler()
+        flow.hass = object()
+        flow.config_entry = CONFIG_ENTRY(data={"host": "http://immich", "api_key": KEY})
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", return_value=False):
+            self.assertEqual("invalid_auth", (await flow.async_step_init())["reason"])
+        with mock.patch("custom_components.immich.ImmichHub.authenticate", side_effect=CannotConnect("down")):
+            self.assertEqual("cannot_connect", (await flow.async_step_init())["reason"])
 
 
 class StringsTest(unittest.TestCase):
